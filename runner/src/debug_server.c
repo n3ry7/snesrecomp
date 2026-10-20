@@ -172,6 +172,7 @@ static void unlock_mutex(void) {
 }
 
 // WRAM write watchpoints
+static void send_line(const char *line);   /* forward (defined at 2105) */
 #define MAX_WATCHPOINTS 8
 static struct {
     uint32_t addr;
@@ -829,6 +830,209 @@ static inline void rdb_record(uint32_t adr, uint16_t old_val, uint16_t new_val, 
 // Forward decl — watchpoint state + body live below the Tier 2.5 block.
 static void rdb_check_watch(uint32_t addr, uint16_t val, uint8_t width);
 
+typedef struct {
+    uint32_t frame;
+    uint32_t pc24;
+    uint8_t  val;
+    uint8_t  vpos;
+    uint16_t hpos;
+} IniWriteRec;
+static IniWriteRec s_ini_writes[512];
+static int s_ini_write_idx = 0;
+static int s_ini_write_count = 0;
+
+void debug_on_inidisp_write(uint32_t frame, uint8_t val) {
+    (void)frame;
+    IniWriteRec *r = &s_ini_writes[s_ini_write_idx];
+    r->frame = (uint32_t)(snes_frame_counter & 0xFFFFFFu);
+    r->pc24  = s_current_block_pc;
+    r->val   = val;
+    r->vpos  = g_snes ? (uint8_t)(g_snes->vPos & 0xFF) : 0;
+    r->hpos  = g_snes ? (uint16_t)(g_snes->hPos & 0x7FF) : 0;
+    s_ini_write_idx = (s_ini_write_idx + 1) % 512;
+    if (s_ini_write_count < 512) s_ini_write_count++;
+}
+
+static void cmd_get_inidisp_writes(const char *args) {
+    int last = 40;
+    if (args && *args) last = atoi(args);
+    if (last > 512) last = 512;
+    if (last > s_ini_write_count) last = s_ini_write_count;
+    char buf[65536];
+    int pos = snprintf(buf, sizeof(buf), "{\"count\":%d,\"writes\":[",
+                       s_ini_write_count);
+    for (int i = 0; i < last; ++i) {
+        int idx = (s_ini_write_idx + 512 - last + i) % 512;
+        IniWriteRec *r = &s_ini_writes[idx];
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+                        "%s{\"f\":%u,\"v\":\"0x%02x\",\"pc\":\"%02x:%04x\",\"vpos\":%d,\"hpos\":%d}",
+                        i ? "," : "", r->frame, r->val,
+                        (r->pc24 >> 16) & 0xFF, r->pc24 & 0xFFFF,
+                        r->vpos, r->hpos);
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    send_line(buf);
+}
+
+// ---- CPU/PPU register write ring (snes_writeReg entry) ----
+// send_fmt lives further down in this file; forward-declare for the
+// command handlers in this block.
+static void send_fmt(const char *fmt, ...);
+// Same shape as s_ini_writes, but keyed by the 16-bit register address, so
+// NMITIMEN/VTIMEL/HV-timer writes come out with the writing block's PC.
+typedef struct {
+    uint32_t frame;
+    uint32_t pc24;
+    uint16_t adr;
+    uint8_t  val;
+    uint8_t  vpos;
+    uint16_t hpos;
+} PRegWriteRec;
+static PRegWriteRec s_preg_writes[512];
+static int s_preg_write_idx = 0;
+static int s_preg_write_count = 0;
+
+void debug_on_preg_write(uint16_t adr, uint8_t val) {
+    PRegWriteRec *r = &s_preg_writes[s_preg_write_idx];
+    r->frame = (uint32_t)(snes_frame_counter & 0xFFFFFFu);
+    r->pc24  = s_current_block_pc;
+    r->adr   = adr;
+    r->val   = val;
+    r->vpos  = g_snes ? (uint8_t)(g_snes->vPos & 0xFF) : 0;
+    r->hpos  = g_snes ? (uint16_t)(g_snes->hPos & 0x7FF) : 0;
+    s_preg_write_idx = (s_preg_write_idx + 1) % 512;
+    if (s_preg_write_count < 512) s_preg_write_count++;
+}
+
+static void cmd_get_preg_writes(const char *args) {
+    int last = 60;
+    int filter_adr = -1;
+    char fbuf[16] = {0};
+    if (args && *args) {
+        if (sscanf(args, "%d %4s", &last, fbuf) < 1) last = 60;
+        if (fbuf[0]) filter_adr = (int)strtol(fbuf, NULL, 16);
+    }
+    if (last > 512) last = 512;
+    // Count matching entries first so "last" means "last N OF THE FILTER".
+    int shown = 0, start = 0;
+    for (int i = 0; i < s_preg_write_count; ++i) {
+        int idx = (s_preg_write_idx + 512 - s_preg_write_count + i) % 512;
+        if (filter_adr < 0 || s_preg_writes[idx].adr == filter_adr) shown++;
+    }
+    if (last > shown) last = shown;
+    if (last > 0) {
+        // walk from the end to find the first (from the end) matching idx
+        int found = 0;
+        for (int i = s_preg_write_count - 1; i >= 0; --i) {
+            int idx = (s_preg_write_idx + 512 - s_preg_write_count + i) % 512;
+            if (filter_adr < 0 || s_preg_writes[idx].adr == filter_adr) {
+                if (++found == last) { start = idx; break; }
+            }
+        }
+        (void)start;
+        char buf[65536];
+        int pos = snprintf(buf, sizeof(buf), "{\"count\":%d,\"writes\":[", shown);
+        int emitted = 0;
+        // emit the final `last` matching records oldest->newest
+        int skip = shown - last;
+        for (int i = 0, seen = 0; i < s_preg_write_count; ++i) {
+            int idx = (s_preg_write_idx + 512 - s_preg_write_count + i) % 512;
+            if (filter_adr < 0 || s_preg_writes[idx].adr == filter_adr) {
+                if (seen++ < skip) continue;
+                PRegWriteRec *r = &s_preg_writes[idx];
+                pos += snprintf(buf + pos, sizeof(buf) - pos,
+                                "%s{\"f\":%u,\"adr\":\"0x%04x\",\"v\":\"0x%02x\",\"pc\":\"%02x:%04x\",\"vpos\":%d,\"hpos\":%d}",
+                                emitted++ ? "," : "", r->frame, r->adr, r->val,
+                                (r->pc24 >> 16) & 0xFF, r->pc24 & 0xFFFF,
+                                r->vpos, r->hpos);
+            }
+        }
+        snprintf(buf + pos, sizeof(buf) - pos, "]}");
+        send_line(buf);
+    } else {
+        send_fmt("{\"count\":%d,\"writes\":[]}", shown);
+    }
+}
+
+// ---- Interrupt delivery trace ----
+// One record per host-side interrupt delivery (generic_frame_driver): the
+// vector, where the interrupted stream was parked, and the first block PCs
+// the guest executed INSIDE the handler -- which resolves the $000500 RAM
+// JML trampoline to whoever is actually installed at delivery time.
+typedef struct {
+    uint32_t frame;
+    uint32_t vector;
+    uint32_t resume;
+    uint32_t after_pc;
+    uint16_t adr;
+    uint8_t  kind;      // 1=NMI, 2=IRQ(slice loop), 3=IRQ(draw rasters)
+    uint8_t  nn;        // entries used in first[]
+    uint8_t  vpos;
+    uint16_t hpos;
+    uint32_t first[8];  // first blocks entered handler-side
+} IntDeliverRec;
+static IntDeliverRec s_int_deliveries[256];
+static int s_int_deliver_idx = 0;
+static int s_int_deliver_count = 0;
+// capture state for the delivery IN PROGRESS (null when none)
+static volatile IntDeliverRec *s_intcap_cur = NULL;
+static volatile int s_intcap_n = 0;
+
+void debug_on_interrupt_delivery(uint32_t vector, uint8_t kind, uint32_t resume, uint16_t adr) {
+    IntDeliverRec *r = &s_int_deliveries[s_int_deliver_idx];
+    r->frame  = (uint32_t)(snes_frame_counter & 0xFFFFFFu);
+    r->vector = vector;
+    r->resume = resume;
+    r->adr    = adr;
+    r->kind   = kind;
+    r->nn     = 0;
+    r->vpos   = g_snes ? (uint8_t)(g_snes->vPos & 0xFF) : 0;
+    r->hpos   = g_snes ? (uint16_t)(g_snes->hPos & 0x7FF) : 0;
+    r->first[0] = 0; r->first[1] = 0; r->first[2] = 0; r->first[3] = 0;
+    r->first[4] = 0; r->first[5] = 0; r->first[6] = 0; r->first[7] = 0;
+    s_int_deliver_idx = (s_int_deliver_idx + 1) % 256;
+    if (s_int_deliver_count < 256) s_int_deliver_count++;
+    s_intcap_cur = r;
+    s_intcap_n = 0;
+}
+
+void debug_on_interrupt_delivery_done(void) {
+    IntDeliverRec *r;
+    if (!s_intcap_cur) return;
+    r = (IntDeliverRec *)s_intcap_cur;
+    r->nn = (uint8_t)s_intcap_n;
+    r->after_pc = s_current_block_pc;
+    s_intcap_cur = NULL;
+    s_intcap_n = 0;
+}
+
+static void cmd_get_interrupt_deliveries(const char *args) {
+    int last = 40;
+    if (args && *args) last = atoi(args);
+    if (last > 256) last = 256;
+    if (last > s_int_deliver_count) last = s_int_deliver_count;
+    char buf[65536];
+    int pos = snprintf(buf, sizeof(buf), "{\"count\":%d,\"deliveries\":[",
+                       s_int_deliver_count);
+    for (int i = 0; i < last; ++i) {
+        int idx = (s_int_deliver_idx + 256 - last + i) % 256;
+        IntDeliverRec *r = &s_int_deliveries[idx];
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+                        "%s{\"f\":%u,\"k\":%u,\"vec\":\"%02x:%04x\",\"res\":\"%02x:%04x\",\"vpos\":%d,\"nn\":%u,\"bs\":[",
+                        i ? "," : "", r->frame, r->kind,
+                        (r->vector >> 16) & 0xFF, r->vector & 0xFFFF,
+                        (r->resume >> 16) & 0xFF, r->resume & 0xFFFF,
+                        r->vpos, r->nn);
+        for (int j = 0; j < r->nn && j < 8; ++j) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "%s\"%02x:%04x\"",
+                            j ? "," : "", (r->first[j] >> 16) & 0xFF, r->first[j] & 0xFFFF);
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    send_line(buf);
+}
+
 void debug_on_wram_write_byte(uint32_t addr, uint8_t old_val, uint8_t val) {
     rdb_record(addr, old_val, val, 1);
     rdb_check_watch(addr, val, 1);
@@ -1205,6 +1409,13 @@ void debug_on_block_enter(uint32_t pc, uint32_t a, uint32_t x, uint32_t y) {
                 break;
             }
         }
+    }
+    /* Interrupt delivery capture: while a host-side run_interrupt is in
+     * flight, log the first block PCs the guest executes handler-side --
+     * stub, $000500 trampoline, then whoever the JML actually lands on. */
+    if (s_intcap_cur && s_intcap_n < 8) {
+        s_intcap_cur->first[s_intcap_n] = pc & 0xFFFFFFu;
+        s_intcap_n++;
     }
     if (record_block) {
         int idx = s_block_trace.write_idx % BLOCK_TRACE_LOG_SIZE;
@@ -8484,6 +8695,9 @@ static const CmdEntry s_commands[] = {
     {"set_cpu",       cmd_set_cpu},
     {"trace_addr",    cmd_trace_addr},
     {"get_trace",     cmd_get_trace},
+    {"get_inidisp_writes", cmd_get_inidisp_writes},
+    {"get_preg_writes", cmd_get_preg_writes},
+    {"get_interrupt_deliveries", cmd_get_interrupt_deliveries},
     {"trace_reg",     cmd_trace_reg},
     {"trace_reg_reset", cmd_trace_reg_reset},
     {"get_reg_trace", cmd_get_reg_trace},

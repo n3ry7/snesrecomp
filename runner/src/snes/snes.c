@@ -608,15 +608,25 @@ void snes_sync_master_clock(Snes *snes, uint64_t master_clock) {
 uint8_t snes_readReg(Snes* snes, uint16_t adr) {
   switch(adr) {
     case 0x4210: {
+      /* Chrono Trigger (SNES, US rev 1.0) boots through a pre-arming RDNMI
+       * poll: Field_EnableNmiIrqAfterInit $C0:00B38 does
+       * `LDA $4210 / BPL` until bit 7 sets, and only THEN writes
+       * $4200=$81 (NMITIMEN) + CLI. With the previous delivery-only
+       * inNmi model bit 7 could never set before $4200 was armed, so the
+       * boot spun forever with frozen WRAM. Model the NMI line as a
+       * free-running PPU status here (same reasoning as the $4212
+       * synthesis): bit 7 = delivered-NMI latch OR live vblank line. The
+       * read-clear of the DELIVERED latch is preserved; the pre-arm
+       * synthetic level comes from the shared beam helper so IRQ/HDMA
+       * timing stay coherent. Beam advance on read keeps tight polls
+       * making wall-clock progress exactly like $4212. */
       uint8_t val = 0x2; // CPU version (4 bit)
       val |= snes->inNmi << 7;
-      // Real hardware clears the NMI-pending latch on read. Without this
-      // a stale `inNmi=true` would persist across NMI handler exit and
-      // produce a spurious second-read=true if anything re-reads $4210
-      // before the next NMI fires. (SMW happens to discard the loaded
-      // value, but a hardware-correct read-clear costs one store and
-      // is the right contract for game #2.)
+      val |= (snes->inVblank || snes->vPos >= 225) << 7; // free-running NMI line
       snes->inNmi = false;
+      extern int g_interp_apu_driving;
+      if (!g_interp_apu_driving)
+        snes_advance_beam(snes, 64, false);
       return val;
     }
     case 0x4211: {
@@ -701,6 +711,12 @@ static int snes_reg_trace_enabled(void) {
 }
 
 void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
+#if SNESRECOMP_TRACE
+  {
+    extern void debug_on_preg_write(uint16_t adr, uint8_t val);
+    debug_on_preg_write(adr, val);
+  }
+#endif
   switch(adr) {
     case 0x4016:
       joypad_write_strobe(snes, val);

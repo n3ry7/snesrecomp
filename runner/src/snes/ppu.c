@@ -3246,6 +3246,12 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
   switch(adr) {
     case INIDISP & 0xff:
       ppu->inidisp = val;
+#if SNESRECOMP_TRACE
+      {
+        extern void debug_on_inidisp_write(uint32_t frame, uint8_t val);
+        debug_on_inidisp_write((uint32_t)snes_frame_counter, val);
+      }
+#endif
       break;
     case OBSEL & 0xff:
       ppu->obsel = val;

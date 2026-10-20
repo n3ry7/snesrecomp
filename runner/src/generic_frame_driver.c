@@ -50,8 +50,15 @@ static uint32_t irq_vector(void)   { return read_vector(0x00FFEEu); }
 /* Run one interrupt handler to its RTI, entered as hardware enters it: the
  * frame is pushed at the PC the guest was interrupted AT, so the handler's
  * terminal RTI returns into that instruction stream. */
-static void run_interrupt(uint32_t vector, uint64_t frame_end) {
+static void run_interrupt(uint32_t vector, uint64_t frame_end, uint8_t kind) {
     cpu_push_interrupt_frame_at(&g_cpu, s_resume_pc);
+#if SNESRECOMP_TRACE
+    {
+        extern void debug_on_interrupt_delivery(uint32_t vector, uint8_t kind,
+                                                uint32_t resume, uint16_t adr);
+        debug_on_interrupt_delivery(vector, kind, s_resume_pc, 0);
+    }
+#endif
     interp_bridge_set_master_deadline(frame_end);
     (void)interp_bridge_run_interrupt(&g_cpu, vector);
     /* Clearing matters: a deadline left armed stays true for every AOT block
@@ -62,6 +69,12 @@ static void run_interrupt(uint32_t vector, uint64_t frame_end) {
         uint32_t resume = interp_bridge_lle_resume_pc();
         if (resume) s_resume_pc = resume;
     }
+#if SNESRECOMP_TRACE
+    {
+        extern void debug_on_interrupt_delivery_done(void);
+        debug_on_interrupt_delivery_done();
+    }
+#endif
 }
 
 static void apply_boot_policy(void) {
@@ -76,6 +89,13 @@ static void apply_boot_policy(void) {
 }
 
 void snes_generic_frame_driver_run_frame(void) {
+#if SNESRECOMP_TRACE
+    /* Heartbeat: which run_frame actually executes (see interrupt-trace probe) */
+    static uint32_t s_gfd_hb = 0;
+    if ((++s_gfd_hb % 600) == 1)
+        fprintf(stderr, "[gfd-heartbeat] frame=%u mi=%d\n",
+                snes_frame_counter, g_snes && g_snes->inNmi ? 1 : 0);
+#endif
     const uint64_t frame_end = g_cpu.master_cycles + GFD_MASTER_CYCLES_PER_FRAME;
     const int booting = (s_resume_pc == 0);
     int slice;
@@ -91,7 +111,7 @@ void snes_generic_frame_driver_run_frame(void) {
      * has not run yet, so there is no instruction stream to interrupt. */
     if (!booting && g_snes->nmiEnabled) {
         g_snes->inNmi = true;
-        run_interrupt(nmi_vector(), frame_end);
+        run_interrupt(nmi_vector(), frame_end, 1);
         g_snes->inNmi = false;
     }
 
@@ -111,7 +131,7 @@ void snes_generic_frame_driver_run_frame(void) {
         /* A raster IRQ asserted while the guest ran: service it before
          * continuing, exactly as the CPU samples it between instructions. */
         if (g_snes->inIrq && !g_cpu._flag_I) {
-            run_interrupt(irq_vector(), frame_end);
+            run_interrupt(irq_vector(), frame_end, 2);
             continue;
         }
         /* Parked with no interrupt pending and clock left over: the guest is
@@ -145,7 +165,18 @@ void snes_generic_frame_driver_draw_ppu_frame(void) {
         if (line == trigger) {
             g_snes->inIrq = true;
             cpu_push_interrupt_frame_at(&g_cpu, s_resume_pc);
+#if SNESRECOMP_TRACE
+            {
+                extern void debug_on_interrupt_delivery(uint32_t vector, uint8_t kind,
+                                                        uint32_t resume, uint16_t adr);
+                extern void debug_on_interrupt_delivery_done(void);
+                debug_on_interrupt_delivery(irq_vector(), 3, s_resume_pc, 0);
+                (void)interp_bridge_run_interrupt(&g_cpu, irq_vector());
+                debug_on_interrupt_delivery_done();
+            }
+#else
             (void)interp_bridge_run_interrupt(&g_cpu, irq_vector());
+#endif
             g_snes->inIrq = false;
             {
                 uint32_t resume = interp_bridge_lle_resume_pc();
