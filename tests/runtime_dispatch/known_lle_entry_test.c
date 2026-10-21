@@ -286,6 +286,34 @@ int main(void) {
     fails += check(g_aot_calls == 2, "LoROM mirror finds exact AOT");
     fails += check(cpu.PB == 0x80, "requested mirror bank remains architectural PB");
 
+    /* Full HiROM pairs share the entire ROM bank. Low/full aliases only
+     * share bytes: a short jump below $8000 has different meaning. */
+    const DispatchEntry hirom_entries[] = {
+        {0xC01000u, {fake_aot, NULL, NULL, NULL}, 0},
+        {0xC09000u, {fake_aot, NULL, NULL, NULL}, 0},
+        {0xFE9000u, {fake_aot, NULL, NULL, NULL}, 0},
+    };
+    int previous_cart_type = cart.type;
+    cart.type = CART_HIROM;
+    cpu_select_program(hirom_entries, 3, NULL, 0);
+    fails += check(cpu_dispatch_has_entry(&cpu, 0x401000u),
+                   "full HiROM lower-half mirror finds compiled entry");
+    fails += check(cpu_dispatch_has_entry(&cpu, 0x409000u),
+                   "full HiROM upper-half mirror finds compiled entry");
+    fails += check(!cpu_dispatch_has_entry(&cpu, 0x009000u) &&
+                       !cpu_dispatch_has_entry(&cpu, 0x809000u),
+                   "low HiROM banks cannot reuse a full-bank compiled body");
+    fails += check(!cpu_dispatch_has_entry(&cpu, 0x7E9000u),
+                   "WRAM never aliases bank FE code");
+    memset(&cpu, 0, sizeof cpu);
+    cpu.S = 0x1C0;
+    fails += check(cpu_dispatch_pc_from(&cpu, 0x401000u, 0x1C2, 0x409000u)
+                   == RECOMP_RETURN_NORMAL && cpu.PB == 0x40 && cpu.A == 1,
+                   "full HiROM mirror executes with requested architectural PB");
+    --g_aot_calls;
+    cart.type = previous_cart_type;
+    cpu_select_program(NULL, 0, NULL, 0);
+
     const DispatchEntry alternate[] = {{0x008300u, {NULL, NULL, NULL, NULL}, 3}};
     cpu_select_program(alternate, 1, NULL, 0);
     fails += check(!cpu_dispatch_has_entry(&cpu, 0x008100u),
