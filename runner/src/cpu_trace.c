@@ -1231,6 +1231,8 @@ void cpu_trace_block_watch_check(CpuState *cpu, uint32_t pc24) {
 }
 
 void cpu_trace_block(CpuState *cpu, uint32_t pc24) {
+    extern int g_debug_call_active;
+    if (g_debug_call_active) return;  /* synthetic debug call: skip reentrant tracing */
     /* AOT block-charge probe (2026-08-31): env SNESRECOMP_AOTBLK="lo-hi"
      * (frame window). Logs pc24 + master_cycles at every AOT block entry so
      * the AOT charge per block can be diffed against the LLE per-block sums

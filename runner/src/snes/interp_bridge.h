@@ -89,7 +89,36 @@ int interp_bridge_run_loop(CpuState *cpu, uint32_t entry_pc24,
  * (NMI/IRQ/coprocessor), so it is a general frame boundary rather than a
  * game-address hint. */
 int interp_bridge_run_until_quiescent(CpuState *cpu, uint32_t entry_pc24);
+/* Run-scoped variant: identical execution, but the yielded continuation is
+ * returned through `*out_yield_pc` only when THIS run's own frame published
+ * it AND the publication was the run's final interpreted step (so it really is
+ * where this run stopped, not a value left over from earlier in the run). A
+ * nested bridge run may still yield and publish internally -- that is how an
+ * outward deadline/yield unwind reaches the owning bounce -- but its PC is not
+ * handed back as this run's continuation. `*out_yield_pc` is set to 0 when this
+ * run did not yield, so the caller can leave its resume cursor alone. */
+int interp_bridge_run_until_quiescent2(CpuState *cpu, uint32_t entry_pc24,
+                                       uint32_t *out_yield_pc);
 uint32_t interp_bridge_lle_resume_pc(void);
+void interp_bridge_set_lle_resume_pc(uint32_t pc);
+
+/* ── Chunked synthetic call (debug host) ──────────────────────────────────
+ * One deadline-bounded slice of a synthetic LLE call whose return frame was
+ * pushed by the caller. Behaves like interp_bridge_run_until_quiescent (a
+ * pending IRQ, the master deadline or a WAI yields to the host) but:
+ *   - the read-only-cycle detector is off, so a WRAM flag poll keeps consuming
+ *     guest time up to the deadline instead of returning after a few cycles;
+ *   - the routine's return is recognized by popping the pushed return-frame
+ *     SENTINEL (return_sentinel_pc) above `s_exit`, so an internal `RTL` in a
+ *     JSR helper does not end the call.
+ * `s_exit` must be the stack pointer just BELOW the pushed frame; pass the
+ * same value on every slice of one call. Returns 1 on any yield; the routine
+ * returned cleanly iff `*out_return_pc` is nonzero. */
+int interp_bridge_run_slice(CpuState *cpu, uint32_t entry_pc24, uint16_t s_exit,
+                            uint16_t return_sentinel_pc,
+                            uint32_t *out_return_pc);
+/* 0x60 (RTS) / 0x6B (RTL) that ended the most recent slice call, 0 if none. */
+int interp_bridge_lle_slice_return_op(void);
 
 /*
  * Rollback support: the bridge carries execution state across frames that no
@@ -124,6 +153,22 @@ int interp_bridge_lle_took_quiescent(void);
  * a productive CPU/MMIO loop from running across multiple vblanks atomically. */
 void interp_bridge_set_master_deadline(uint64_t master_clock);
 void interp_bridge_reset_dynamic_cache(void);
+
+/* Extend the master deadline to NESTED bridge runs (a tier-down/tail dispatch
+ * entered from an AOT block inside the current slice).  Default off: only the
+ * root auto-quiescent run honours the deadline, so an AOT chain that re-enters
+ * the interpreter at a function with no body for the live (m,x) can spin to
+ * the step cap inside a single slice -- exactly what a battle-init
+ * `INC abs / LDA abs / CMP / BNE` wait for an NMI-maintained counter does.
+ *
+ * When on, a nested run that reaches the deadline arms the existing
+ * deadline-unwind sentinel (s_lle_unwind_is_deadline) and returns, so every
+ * generated callsite propagates it to the owning bounce; that bounce returns
+ * to the host, which can deliver the vblank NMI and resume at the waited-on
+ * instruction.  Interrupt-handler runs (stop_on_rti) are never interrupted.
+ * Game-specific policy: the host enables this only while its battle mode is
+ * live (see src/game_rtl.c), leaving field pacing bit-identical. */
+void interp_bridge_set_nested_deadline_yield(int on);
 
 /* True only while a paired AOT bounce is executing inside an auto-quiescent
  * scheduler whose current frame deadline has been reached. Long,

@@ -546,6 +546,19 @@ uint16 cpu_read16(CpuState *cpu, uint8 bank, uint16 addr) {
 }
 
 void cpu_write8(CpuState *cpu, uint8 bank, uint16 addr, uint8 v) {
+    /* Debug workaround: BattleSys_RunFrame spins on $CA20 until its battle
+     * NMI clears it.  When the host frame model is not delivering that NMI,
+     * holding the latch at zero lets the render/logic step run. */
+    {
+        static int zero_ca20 = -1;
+        if (zero_ca20 < 0) {
+            const char *e = getenv("SNESRECOMP_ZERO_CA20");
+            zero_ca20 = (e && e[0] && e[0] != '0') ? 1 : 0;
+        }
+        if (zero_ca20 && addr == 0xCA20 &&
+            (bank == 0x00 || bank == 0x7E))
+            v = 0;
+    }
     if (g_snes && g_snes->cart)
         cart_note_cpu_bus(g_snes->cart, bank, addr);
     cpu->open_bus = v;

@@ -474,15 +474,67 @@ static int      s_lle_unwind_owner_depth = 0;
 static int      s_lle_unwind_is_deadline = 0;
 static int      s_lle_next_unwind_is_deadline = 0;
 static uint32_t s_lle_resume_pc24   = 0;
+/* Nesting depth of the bridge run that last wrote s_lle_resume_pc24, captured
+ * by lle_set_resume_pc() at the write. -1 means "no run has published since
+ * the cell was cleared". A host that starts a run at depth D can therefore
+ * tell its OWN yield (published at depth D+1, because run_ex2 increments the
+ * depth before entering the core) from a NESTED run's yield (depth > D+1).
+ * Without this, a nested tier-down that yielded left its continuation in the
+ * cell and the outer run -- which went on to complete normally -- published a
+ * stale PC into the host's resume cursor. */
+static int      s_lle_resume_pc24_depth = -1;
+/* g_interp_bridge_steps at the write, plus the writing source line. Every
+ * yield site publishes the continuation and RETURNS from its run immediately,
+ * so a value written at the run's final interpreted step is a real yield. A
+ * value written earlier in a run that then executed more interpreted code and
+ * ended through a non-local return (SKIP/unwind) is stale by construction;
+ * the host must not resume at it. */
+static unsigned long long s_lle_resume_pc24_step = 0;
+static int      s_lle_resume_pc24_site = 0;
 static int      s_interp_pctrace    = 0;
 static int      s_lle_wai_yield     = 0;
 static int      s_lle_quiescent_yield = 0;
 static uint64_t s_lle_master_deadline = 0;
+/* Host policy: honour the master deadline in nested (tier-down) interpreter
+ * runs too. See interp_bridge_set_nested_deadline_yield(). Off by default so
+ * whole-program LLE ports keep their existing field pacing. */
+static int      s_lle_deadline_yield_nested = 0;
+/* ── chunked synthetic call (debug host) ───────────────────────────────────
+ * A synthetic LLE call runs on the debug-server thread while the main frame
+ * driver is parked, so nothing delivers NMI/IRQ while it runs. The host runs
+ * it in deadline-bounded SLICES instead: each slice uses the auto-quiescent
+ * scheduling (IRQ/deadline/WAI yields) but
+ *   - skips the read-only-cycle detector, which would otherwise return at the
+ *     first WRAM poll (e.g. `LDA $CD02 / BEQ`) after a handful of cycles and
+ *     never let guest time reach the frame deadline, and
+ *   - keeps the RTS/RTL exit, keyed on the pushed return-frame SENTINEL rather
+ *     than only the stack watermark, so an internal long-return (`RTL` inside
+ *     a JSR helper, common in CT) cannot end the call early.
+ * Between slices the host delivers the interrupts the frame driver would.
+ * s_lle_slice_depth pins slice semantics to the ROOT bridge frame; a nested
+ * bounce/tier-down inside the routine is an ordinary bridge run. */
+static int      s_lle_slice_mode   = 0;
+static int      s_lle_slice_depth  = -1;
+static uint16_t s_lle_slice_sentinel_pc = 0xFFFFu;
+static int      s_lle_slice_return_op   = 0;
 /* Depth of nested interpreter runs and the run that owns the current paired
  * AOT bounce. A rewritten/non-local return from that AOT root must resume the
  * owning interpreter's guest call chain. */
 static int      s_interp_bridge_depth = 0;
 static int      s_interp_bounce_owner_depth = 0;
+/* Publish a guest continuation to the host and record WHICH run published it.
+ * Every yield site goes through here. Nested runs keep publishing -- their
+ * own callers/consumers still see the cell, and the sentinel/unwind paths
+ * that hand a continuation outward are unaffected -- but the depth stamp
+ * lets the outermost host entry accept only the value its own frame wrote. */
+static void lle_set_resume_pc_site(uint32_t pc, int site) {
+    extern unsigned long long g_interp_bridge_steps;
+    s_lle_resume_pc24 = pc;
+    s_lle_resume_pc24_depth = s_interp_bridge_depth;
+    s_lle_resume_pc24_step = g_interp_bridge_steps;
+    s_lle_resume_pc24_site = site;
+}
+#define lle_set_resume_pc(pc) lle_set_resume_pc_site((pc), __LINE__)
 /* Count of AOT bodies entered through the paired ABI. Exposed so a host
  * can tell a genuinely-compiled run from one that quietly interpreted
  * everything -- without it, a wall-clock tier comparison is unreadable. */
@@ -626,7 +678,7 @@ int interp_bridge_in_lle_scheduler(void) { return s_lle_sched_depth > 0; }
 static int bridge_cooperative_yield(CpuState *cpu, const Interp816 *in,
                                     uint32_t pc24, uint32_t yield_pc) {
     if (yield_pc) {
-        s_lle_resume_pc24 = pc24;
+        lle_set_resume_pc(pc24);
     } else {
         s_lle_unwind_active = 1;
         s_lle_unwind_pc24 = pc24;
@@ -638,7 +690,12 @@ static int bridge_cooperative_yield(CpuState *cpu, const Interp816 *in,
     return 1;
 }
 uint32 interp_bridge_lle_resume_pc(void) { return s_lle_resume_pc24; }
-void interp_bridge_set_lle_resume_pc(uint32_t pc) { s_lle_resume_pc24 = pc; }
+void interp_bridge_set_lle_resume_pc(uint32_t pc) {
+    s_lle_resume_pc24 = pc;
+    /* A host-side override belongs to no bridge run; clearing must also clear
+     * the ownership stamp so a later run-scoped read cannot adopt it. */
+    s_lle_resume_pc24_depth = pc ? s_interp_bridge_depth : -1;
+}
 
 /* ── rollback state (see interp_bridge.h) ─────────────────────────────── */
 
@@ -652,6 +709,7 @@ typedef struct {
     unsigned bus_cycles;
     int      bus_timing_active;
     uint32_t lle_resume_pc24;
+    int      lle_resume_pc24_depth;
     int      lle_wai_yield;
     uint64_t lle_master_deadline;
     BridgeDynamicValue dynamic_values[64];
@@ -674,6 +732,7 @@ void interp_bridge_rb_state_save(void *out) {
     s->bus_cycles             = s_interp_bus_cycles;
     s->bus_timing_active      = s_interp_bus_timing_active;
     s->lle_resume_pc24        = s_lle_resume_pc24;
+    s->lle_resume_pc24_depth  = s_lle_resume_pc24_depth;
     s->lle_wai_yield          = s_lle_wai_yield;
     s->lle_master_deadline    = s_lle_master_deadline;
     memcpy(s->dynamic_values, s_bridge_dynamic_values,
@@ -692,6 +751,8 @@ void interp_bridge_rb_state_load(const void *in) {
     s_interp_bus_cycles           = s->bus_cycles;
     s_interp_bus_timing_active    = s->bus_timing_active;
     s_lle_resume_pc24             = s->lle_resume_pc24;
+    s_lle_resume_pc24_depth       = s->lle_resume_pc24_depth;
+    s_lle_resume_pc24_step        = 0;
     s_lle_wai_yield               = s->lle_wai_yield;
     s_lle_master_deadline         = s->lle_master_deadline;
     memcpy(s_bridge_dynamic_values, s->dynamic_values,
@@ -715,6 +776,10 @@ int interp_bridge_lle_took_quiescent(void) {
 }
 void interp_bridge_set_master_deadline(uint64_t master_clock) {
     s_lle_master_deadline = master_clock;
+}
+
+void interp_bridge_set_nested_deadline_yield(int on) {
+    s_lle_deadline_yield_nested = on ? 1 : 0;
 }
 
 int interp_bridge_lle_master_deadline_reached(const CpuState *cpu) {
@@ -1173,6 +1238,10 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                                  const uint32_t *stop_pcs, int n_stop,
                                  int stop_on_rti) {
     const int auto_quiescent = yield_pc == 0xFFFFFFFEu;
+    /* Chunked synthetic call (interp_bridge_run_slice): auto-quiescent
+     * scheduling, but the ROOT frame only — nested bridge runs keep ordinary
+     * semantics. */
+    const int slice_mode = (s_lle_slice_mode && s_interp_bridge_depth == s_lle_slice_depth);
     /* Local interpreter context → nesting (an AOT bounce that itself traps and
      * re-enters the bridge) gets its own frame; no shared mutable interp. */
     Interp816 in;
@@ -1263,6 +1332,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
     }
     for (; steps < step_cap; steps++) {
         const uint32_t pc_before = ((uint32_t)in.k << 16) | in.pc;
+        if (pc_before == 0xC06D7Fu || pc_before == 0xC06D81u) { fprintf(stderr, "MARK_TOP pc=%06X steps=%ld\n", (unsigned)pc_before, steps); fflush(stderr); }
 #ifdef SNESRECOMP_INTERP_PROFILE
         g_interp_total_steps++;
         interp_hist_init();
@@ -1290,6 +1360,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             interp_hist_add(pc_before);
         }
 #endif
+        if (pc_before == 0xC06D7Fu) { fprintf(stderr, "MARK_BEFORE_PCTRACE pc=%06X\n", (unsigned)pc_before); fflush(stderr); }
         /* SNESRECOMP_INTERP_PCTRACE=N: print the PC every N steps. For the case
          * the bail-time trace cannot reach -- a run that never bails and never
          * returns, where the question is simply "where is it". */
@@ -1311,6 +1382,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
         debug_on_block_enter(pc_before, in.a, in.x, in.y);
         sync_cpu_to_interp(cpu, &in);
 #endif
+        if (pc_before == 0xC06D7Fu) { fprintf(stderr, "MARK_AFTER_REVDBG pc=%06X\n", (unsigned)pc_before); fflush(stderr); }
         /* IRQs are sampled between instructions.  An auto-quiescent whole-
          * program run must return to its owning scheduler as soon as either
          * the CPU H/V comparator or a coprocessor asserts IRQ; otherwise a
@@ -1327,18 +1399,48 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
               cx4_irq_pending(g_snes->cart->cx4)) ||
              (g_snes->cart && g_snes->cart->sa1 &&
               sa1_cpu_irq_pending(g_snes->cart->sa1)))) {
-            s_lle_resume_pc24=pc_before;
+            lle_set_resume_pc(pc_before);
             sync_interp_to_cpu(&in,cpu);
             bridge_apu_flush(cpu);
             return 1;
         }
         if (auto_quiescent && s_lle_master_deadline &&
             cpu->master_cycles >= s_lle_master_deadline) {
-            s_lle_resume_pc24=pc_before;
+            lle_set_resume_pc(pc_before);
             sync_interp_to_cpu(&in,cpu);
             bridge_apu_flush(cpu);
             return 1;
         }
+        /* Nested run past the host deadline.  AOT blocks poll the deadline in
+         * their prologue and arm the same unwind; a function with no body for
+         * the live (m,x) falls to this interpreter instead and would otherwise
+         * run to the step cap inside one slice.  Arm the deadline unwind so
+         * the owning bounce returns to the host, which delivers the vblank
+         * NMI and re-enters at pc_before.  Requires a live bounce owner: with
+         * none there is no callsite that can consume the sentinel.  Handler
+         * runs (stop_on_rti) must reach their RTI and are never cut here. */
+        if (s_lle_deadline_yield_nested && !auto_quiescent && !stop_on_rti &&
+            s_interp_bridge_depth > 1 && s_interp_bounce_owner_depth > 0 &&
+            s_lle_master_deadline &&
+            cpu->master_cycles >= s_lle_master_deadline) {
+            static int nested_log = -1;
+            if (nested_log < 0)
+                nested_log = getenv("SNESRECOMP_NESTED_YIELD_LOG") ? 1 : 0;
+            if (nested_log)
+                fprintf(stderr,
+                        "[nested-yield] f=%d pc=$%06X depth=%d owner=%d "
+                        "S=$%04X master=%llu deadline=%llu\n",
+                        snes_frame_counter, (unsigned)pc_before,
+                        s_interp_bridge_depth, s_interp_bounce_owner_depth,
+                        (unsigned)cpu->S,
+                        (unsigned long long)cpu->master_cycles,
+                        (unsigned long long)s_lle_master_deadline);
+            (void)interp_bridge_lle_yield_unwind(cpu, pc_before);
+            sync_interp_to_cpu(&in,cpu);
+            bridge_apu_flush(cpu);
+            return 1;
+        }
+        if (pc_before == 0xC06D7Fu) { fprintf(stderr, "MARK_AFTER_IRQ pc=%06X\n", (unsigned)pc_before); fflush(stderr); }
         /* Star Ocean battle $00D9 work-wait specialization. This does not skip
          * the wait; it executes the LDA $00D9 / BEQ loop with the same master
          * timing and IRQ/deadline sampling, but avoids the full interpreter bus
@@ -1358,14 +1460,14 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             if (s_d9_bytes_ok) {
                 for (;;) {
                     if (auto_quiescent && !in.i && g_snes && g_snes->inIrq) {
-                        s_lle_resume_pc24 = ((uint32_t)in.k << 16) | in.pc;
+                        lle_set_resume_pc(((uint32_t)in.k << 16) | in.pc);
                         sync_interp_to_cpu(&in, cpu);
                         bridge_apu_flush(cpu);
                         return 1;
                     }
                     if (auto_quiescent && s_lle_master_deadline &&
                         cpu->master_cycles >= s_lle_master_deadline) {
-                        s_lle_resume_pc24 = ((uint32_t)in.k << 16) | in.pc;
+                        lle_set_resume_pc(((uint32_t)in.k << 16) | in.pc);
                         sync_interp_to_cpu(&in, cpu);
                         bridge_apu_flush(cpu);
                         return 1;
@@ -1401,14 +1503,14 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                         cart_sync_coprocessors(g_snes->cart, cpu->master_cycles);
                     cpu->coprocessor_master_cycles = cpu->master_cycles;
                     if (auto_quiescent && !in.i && g_snes && g_snes->inIrq) {
-                        s_lle_resume_pc24 = 0xC084B4u;
+                        lle_set_resume_pc(0xC084B4u);
                         sync_interp_to_cpu(&in, cpu);
                         bridge_apu_flush(cpu);
                         return 1;
                     }
                     if (auto_quiescent && s_lle_master_deadline &&
                         cpu->master_cycles >= s_lle_master_deadline) {
-                        s_lle_resume_pc24 = 0xC084B4u;
+                        lle_set_resume_pc(0xC084B4u);
                         sync_interp_to_cpu(&in, cpu);
                         bridge_apu_flush(cpu);
                         return 1;
@@ -1434,6 +1536,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                 continue;
             }
         }
+        if (pc_before == 0xC06D7Fu) { fprintf(stderr, "MARK_AFTER_D9FF pc=%06X\n", (unsigned)pc_before); fflush(stderr); }
         /* --- Star Ocean vblank-spin fast-forward ---
          * The game has several copies of the same beam-wait routine: the
          * main loop ($C8:F40F/F414/F425/F42A), battle engine ($CC:0538/3D/4E/53),
@@ -1501,7 +1604,9 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             if (s_vff_ok) {
                 extern int snes_frame_counter;
                 if (snes_frame_counter > 10 && !g_snes->hIrqEnabled) {
-                    const uint8_t op = bridge_bus_read(cpu, pc_before);
+                    if (pc_before == 0xC06D7Fu) { fprintf(stderr, "MARK_OP_BEFORE pc=%06X\n", (unsigned)pc_before); fflush(stderr); }
+        const uint8_t op = bridge_bus_read(cpu, pc_before);
+        if (pc_before == 0xC06D7Fu) { fprintf(stderr, "MARK_OP_AFTER op=%02X\n", (unsigned)op); fflush(stderr); }
                     const uint8_t lo = bridge_bus_read(cpu, pc_before + 1);
                     const uint8_t hi = bridge_bus_read(cpu, pc_before + 2);
                     /* Both LDA abs (0xAD, branch at pc+3) and LDA long
@@ -1598,7 +1703,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                 }
             }
         }
-        if (auto_quiescent) {
+        if (auto_quiescent && !slice_mode) {
             QuiescentState now;
             memset(&now, 0, sizeof now);
             now.pc=pc_before; now.a=in.a; now.x=in.x; now.y=in.y;
@@ -1629,7 +1734,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                          * and could starve rendering.  Live MMIO polls are not
                          * mistaken for this path: continuous_read_epoch changes
                          * on every such read. */
-                        s_lle_resume_pc24=pc_before;
+                        lle_set_resume_pc(pc_before);
                         s_lle_quiescent_yield = 1;
                         /* Flush accumulated SPC time BEFORE yielding so the
                          * SPC700 processes any pending port writes (Star Ocean
@@ -1645,6 +1750,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             }
             qring[steps & 63]=now;
         }
+        if (pc_before == 0xC06D7Fu) { fprintf(stderr, "MARK_HOOKS pc=%06X\n", (unsigned)pc_before); fflush(stderr); }
         if (s_pre_opcode_hook_count > 0) {
             int redirected = 0;
             const uint32_t key = pc_before & 0x7FFFFFu;
@@ -1905,7 +2011,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                 }
             }
             if (_yield_flag == yield_flag_value) {
-                s_lle_resume_pc24 = pc_before;
+                lle_set_resume_pc(pc_before);
                 sync_interp_to_cpu(&in, cpu);
                 bridge_apu_flush(cpu);
                 return 1;
@@ -1938,7 +2044,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                 }
             }
         }
-        const uint8_t  op = bridge_bus_read(cpu, pc_before);
+        const uint8_t op = bridge_bus_read(cpu, pc_before);
 #ifdef SNESRECOMP_INTERP_PROFILE
         if ((steps & 8191u) == 0) {
             static clock_t _rl_last = 0;
@@ -2226,7 +2332,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
         if (in.waiting) {
             in.waiting = false;
             if (auto_quiescent || yield_pc) {
-                s_lle_resume_pc24 = ((uint32_t)in.k << 16) | in.pc;
+                lle_set_resume_pc(((uint32_t)in.k << 16) | in.pc);
                 s_lle_wai_yield = 1;
                 sync_interp_to_cpu(&in, cpu);
                 bridge_apu_flush(cpu);
@@ -2246,6 +2352,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             return 1;
         }
 
+        if (pc_before == 0xC06D7Fu) { fprintf(stderr, "MARK_MID1 pc=%06X\n", (unsigned)pc_before); fflush(stderr); }
         /* Resolved-landing capture (Phase 2 manifest): the PC reached after
          * the FIRST opcode. When entered at an indirect JMP/JML (the
          * unresolved-IndirectGoto tier-down), this is the dynamically resolved
@@ -2351,7 +2458,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                     if (s_lle_unwind_active) {
                         if (s_lle_unwind_owner_depth == s_interp_bridge_depth) {
                             if (s_lle_unwind_is_deadline) {
-                                s_lle_resume_pc24 = s_lle_unwind_pc24;
+                                lle_set_resume_pc(s_lle_unwind_pc24);
                                 s_lle_unwind_active = 0;
                                 s_lle_unwind_owner_depth = 0;
                                 s_lle_unwind_is_deadline = 0;
@@ -2483,14 +2590,37 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
          * the handler mid-flight — leaving re-entrancy guards stuck (Metal
          * Warriors: TSB $12=#$8000, never TRB) and DMA queues unserviced.
          * Interrupt runs exit only on the architectural RTI below. */
-        if (is_ret && !yield_pc && !stop_on_rti) {
+        if (pc_before == 0xC06D7Fu) { fprintf(stderr, "MARK_MID2 pc=%06X\n", (unsigned)pc_before); fflush(stderr); }
+        if (is_ret && (!yield_pc || slice_mode) && !stop_on_rti) {
+            /* Slice mode additionally requires the popped return address to be
+             * the synthetic frame's sentinel: CT's JSR helpers commonly end in
+             * RTL, and a bare stack watermark would end the call at the first
+             * such internal long-return. */
+            const int ret_ok = slice_mode
+                ? ((in.pc == s_lle_slice_sentinel_pc ||
+                    in.pc == (uint16_t)(s_lle_slice_sentinel_pc + 1u)) &&
+                   (uint16_t)in.sp > s_enter)
+                : ((uint16_t)in.sp > s_enter);
+            if (slice_mode) {
+                static int _sdbg = -1;
+                if (_sdbg < 0) _sdbg = getenv("SNESRECOMP_SLICE_DBG") ? 1 : 0;
+                if (_sdbg)
+                    fprintf(stderr, "[slice_ret] op=$%02X pc=$%06X popped=%02X:%04X "
+                            "sp=$%04X enter=$%04X sent=$%04X ok=%d\n",
+                            op, (unsigned)pc_before, (unsigned)in.k,
+                            (unsigned)in.pc, (unsigned)in.sp,
+                            (unsigned)s_enter, (unsigned)s_lle_slice_sentinel_pc,
+                            ret_ok);
+            }
             if (_ibrw)
                 fprintf(stderr, "[ibr] ret  op=$%02X pc=$%06X sp=$%04X "
-                        "(s_enter=$%04X exit=%d)\n",
+                        "(s_enter=$%04X exit=%d slice=%d sentinel=%d)\n",
                         op, (unsigned)pc_before, (unsigned)in.sp,
-                        (unsigned)s_enter, (int)((uint16_t)in.sp > s_enter));
-            if ((uint16_t)in.sp > s_enter) {
+                        (unsigned)s_enter, (int)((uint16_t)in.sp > s_enter),
+                        slice_mode, (int)(in.pc == s_lle_slice_sentinel_pc));
+            if (ret_ok) {
                 /* The interpreted routine returned past its entry depth. */
+                if (slice_mode) s_lle_slice_return_op = op;
                 if (out_return_pc)
                     *out_return_pc = ((uint32_t)in.k << 16) | in.pc;
                 sync_interp_to_cpu(&in, cpu);
@@ -2536,7 +2666,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
      * Interrupt handlers must complete (RTI) or be discarded entirely;
      * the caller (so_rtl.c) saves/restores the CPU stack to handle bail. */
     if (!stop_on_rti)
-        s_lle_resume_pc24 = ((uint32_t)in.k << 16) | in.pc;
+        lle_set_resume_pc(((uint32_t)in.k << 16) | in.pc);
     sync_interp_to_cpu(&in, cpu);
     bridge_apu_flush(cpu);
     /* Post-sync diagnostic: decode the instruction at step-cap PC */
@@ -2741,6 +2871,140 @@ int interp_bridge_run_until_quiescent(CpuState *cpu, uint32_t entry_pc24) {
     return interp_bridge_run_ex2(cpu, entry_pc24, cpu->S, NULL, NULL,
                                  0xFFFFFFFEu, 0, 0, 0, NULL, 0, 0);
 }
+
+/* Run-scoped form of interp_bridge_run_until_quiescent.
+ *
+ * The resume cell is process-global and is written by EVERY bridge run. Two
+ * kinds of write used to leak into the host's cursor:
+ *
+ *   1. a NESTED run -- a tier-down entered from a compiled body inside this
+ *      run, i.e. depth > D+1 while this call's own frame sits at depth D+1.
+ *      It can yield (that is how an outward deadline/yield unwind reaches the
+ *      owning bounce) and publish its PC, and the outer run may then go on to
+ *      complete normally with no continuation of its own;
+ *   2. an EARLIER write in this same run, followed by more interpreted code
+ *      and a non-local exit (SKIP/unwind) instead of a yield.
+ *
+ * Either way the host adopted a PC that was not "where this run stopped", and
+ * the next frame resumed inside a routine whose return frame had already been
+ * consumed. On the CT battle-exit path that re-entered BattleAnim_RunDissolve
+ * after its CD0109 RTL had popped the caller's frame; the following RTL walked
+ * into the bank-0 jump table (PB $CD -> $00).
+ *
+ * Scoping rule: clear the cell before the run, and publish a value to the
+ * caller only when BOTH hold:
+ *   - the write came from this run's own frame
+ *     (s_lle_resume_pc24_depth == entry_depth + 1), and
+ *   - the write happened at the run's final interpreted step
+ *     (s_lle_resume_pc24_step == g_interp_bridge_steps). Every yield site
+ *     publishes its continuation and returns immediately, so a genuine yield
+ *     always satisfies this; a value written earlier in a run that then ran
+ *     more code cannot.
+ *
+ * Nested runs still write the cell exactly as before. That matters: their
+ * writes are what the unwind/sentinel machinery carries outward, and the
+ * OWNING bounce site re-publishes at its own depth. What cannot happen any
+ * more is a nested or superseded value being handed back as this run's
+ * continuation.
+ *
+ * `*out_yield_pc` is 0 when this run produced no continuation; the caller
+ * keeps its previous resume cursor in that case. */
+int interp_bridge_run_until_quiescent2(CpuState *cpu, uint32_t entry_pc24,
+                                       uint32_t *out_yield_pc) {
+    const int entry_depth = s_interp_bridge_depth;
+    if (out_yield_pc) *out_yield_pc = 0;
+    s_lle_resume_pc24 = 0;
+    s_lle_resume_pc24_depth = -1;
+    s_lle_resume_pc24_step = 0;
+#ifdef SNESRECOMP_INTERP_PROFILE
+    clock_t _t0 = clock();
+    bridgeq_prof_calls++;
+#endif
+    int _r = interp_bridge_run_ex2(cpu, entry_pc24, cpu->S, NULL, NULL,
+                                   0xFFFFFFFEu, 0, 0, 0, NULL, 0, 0);
+#ifdef SNESRECOMP_INTERP_PROFILE
+    bridgeq_prof_ms += 1000.0 * ((double)(clock() - _t0)) / CLOCKS_PER_SEC;
+#endif
+    /* Accept only this run's own, current continuation, then leave the cell
+     * holding exactly that: a nested or superseded value has already been
+     * consumed (or republished by the owning bounce), so keeping it would just
+     * be the stale-state hazard this variant exists to remove. Diagnostics
+     * that sample the cell (get_v2_cpu resume_pc) therefore see the same value
+     * the host cursor used. */
+    const int own = (s_lle_resume_pc24_depth == entry_depth + 1);
+    const int current = (s_lle_resume_pc24_step == g_interp_bridge_steps);
+    uint32_t yielded = 0;
+    if (s_lle_resume_pc24 && own && current)
+        yielded = s_lle_resume_pc24;
+    /* Env-gated observability (SNESRECOMP_RESUME_SCOPE_LOG=1): name every
+     * value this variant refused to publish, and every value it did. */
+    {
+        static int scope_log = -1;
+        if (scope_log < 0)
+            scope_log = getenv("SNESRECOMP_RESUME_SCOPE_LOG") ? 1 : 0;
+        if (scope_log) {
+            extern int snes_frame_counter;
+            if (s_lle_resume_pc24 && !own)
+                fprintf(stderr, "[resume-scope] f=%d DROP nested pc=$%06X "
+                        "depth=%d entry=%d entry_pc=$%06X\n",
+                        snes_frame_counter, (unsigned)s_lle_resume_pc24,
+                        s_lle_resume_pc24_depth, entry_depth,
+                        (unsigned)entry_pc24);
+            else if (s_lle_resume_pc24 && !current)
+                fprintf(stderr, "[resume-scope] f=%d DROP superseded "
+                        "pc=$%06X site=%d step=%llu end=%llu entry_pc=$%06X "
+                        "r=%d\n",
+                        snes_frame_counter, (unsigned)s_lle_resume_pc24,
+                        s_lle_resume_pc24_site,
+                        s_lle_resume_pc24_step, g_interp_bridge_steps,
+                        (unsigned)entry_pc24, _r);
+            else if (yielded)
+                fprintf(stderr, "[resume-scope] f=%d PUBLISH pc=$%06X "
+                        "depth=%d site=%d entry_pc=$%06X r=%d\n",
+                        snes_frame_counter, (unsigned)yielded,
+                        s_lle_resume_pc24_depth, s_lle_resume_pc24_site,
+                        (unsigned)entry_pc24, _r);
+        }
+    }
+    s_lle_resume_pc24 = yielded;
+    s_lle_resume_pc24_depth = yielded ? entry_depth + 1 : -1;
+    if (out_yield_pc) *out_yield_pc = yielded;
+    return _r;
+}
+
+/* One deadline-bounded slice of a chunked synthetic LLE call.
+ *
+ * Runs entry_pc24 in auto-quiescent scheduling (so a pending IRQ, the master
+ * deadline or a WAI hands control back) with the read-only-cycle detector
+ * DISABLED, and exits the call only when a return pops the pushed sentinel
+ * frame (`s_exit` is the stack pointer just BELOW that frame). The host
+ * re-enters at the reported resume PC after servicing interrupts, passing the
+ * same `s_exit` so the watermark survives across slices.
+ *
+ * Returns 1 on any yield (interrupt, deadline, WAI, or the routine's return);
+ * `*out_return_pc` is nonzero only for the return case. */
+int interp_bridge_run_slice(CpuState *cpu, uint32_t entry_pc24, uint16_t s_exit,
+                            uint16_t return_sentinel_pc,
+                            uint32_t *out_return_pc) {
+    const int      saved_mode = s_lle_slice_mode;
+    const int      saved_depth = s_lle_slice_depth;
+    const uint16_t saved_sent = s_lle_slice_sentinel_pc;
+    s_lle_slice_mode = 1;
+    /* run_ex2 increments the depth before entering the core. */
+    s_lle_slice_depth = s_interp_bridge_depth + 1;
+    s_lle_slice_sentinel_pc = return_sentinel_pc;
+    s_lle_slice_return_op = 0;
+    if (out_return_pc) *out_return_pc = 0;
+    int r = interp_bridge_run_ex2(cpu, entry_pc24, s_exit, NULL, out_return_pc,
+                                  0xFFFFFFFEu, 0, 0, 0, NULL, 0, 0);
+    s_lle_slice_mode = saved_mode;
+    s_lle_slice_depth = saved_depth;
+    s_lle_slice_sentinel_pc = saved_sent;
+    return r;
+}
+
+/* Opcode (0x60 RTS / 0x6B RTL) that ended the most recent slice call. */
+int interp_bridge_lle_slice_return_op(void) { return s_lle_slice_return_op; }
 
 int interp_bridge_run_interrupt(CpuState *cpu, uint32_t entry_pc24) {
     /* Always-on per-frame tally. This is the single choke point every host
@@ -3268,6 +3532,14 @@ RecompReturn interp_tier_run_call_frame(CpuState *cpu, uint32_t target_pc24,
     tier2_discover(source_pc24, target_pc24, mx, TIER2_KIND_DISPATCH, -1);
     const uint16_t watermark = cpu->S;
     const uint16_t post_call = (uint16_t)(cpu->S + frame_size);
+    /* Architectural caller state, restored on a step-cap bail: an aborted
+     * callee must not leave its own bank behind, because the generated
+     * caller's deadline prologue derives the yield PC as
+     * (cpu->PB << 16) | post_call_pc.  Leaving PB at the callee's bank
+     * fabricated CD:004D from a C1:004D post-JSR PC and sent the frame
+     * driver back into the battle dissolve without a return frame. */
+    const uint8_t saved_pb = cpu->PB;
+    const uint8_t saved_db = cpu->DB;
     uint32_t landing = target_pc24;
     int ok = interp_bridge_run_ex2(cpu, target_pc24, watermark, &landing,
                                    return_pc24, 0, 0, 0, 0, NULL, 0, 0);
@@ -3279,6 +3551,8 @@ RecompReturn interp_tier_run_call_frame(CpuState *cpu, uint32_t target_pc24,
         return propagated;
     if (!ok) {
         cpu->S = post_call;  /* bail: discard the unconsumed JSR frame */
+        cpu->PB = saved_pb;  /* ... and discard the aborted callee's bank */
+        cpu->DB = saved_db;
         return RECOMP_RETURN_NORMAL;
     }
     if (cpu->S != post_call) {

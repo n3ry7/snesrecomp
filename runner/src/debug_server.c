@@ -60,6 +60,7 @@ extern int snes_frame_counter;
 #include "snes/interp_bridge.h"
 #include "cpu_state.h"
 #include "cpu_trace.h"
+#include "common_rtl.h"
 #include "ppu_dma_trace.h"
 #if SNESRECOMP_ENABLE_MODS
 #include "snes_text_xlate.h"
@@ -1382,6 +1383,12 @@ static void rdb_check_watch(uint32_t addr, uint16_t val, uint8_t width) {
     s_rdb_parked_stack_depth = 0;
 }
 
+/* Set while a synthetic debug call (call_func / call_func_lle) is executing on
+ * the debug-server thread.  The pause gate below must not park that thread: the
+ * main thread is already spinning in debug_server_wait_if_paused() and cannot
+ * release a guest block that runs on the server thread. */
+extern int g_debug_call_active;
+
 void debug_on_block_enter(uint32_t pc, uint32_t a, uint32_t x, uint32_t y) {
     // Tier 3: bump the monotonic block counter on EVERY hook call,
     // regardless of trace state, so WRAM writes can correlate to block
@@ -1440,7 +1447,7 @@ void debug_on_block_enter(uint32_t pc, uint32_t a, uint32_t x, uint32_t y) {
     // the main thread parks at the next block boundary. Without this,
     // setting s_paused=1 from TCP had no effect (the wait was only
     // entered on breakpoint hit). 2026-05-03.
-    if (s_paused) {
+    if (s_paused && !g_debug_call_active) {
         debug_server_wait_if_paused();
         return;
     }
@@ -4314,7 +4321,10 @@ static void _file_sli_func(SaveLoadInfo *info, void *data, size_t size) {
 
 // 4-byte magic + 4-byte version lets us evolve the format.
 #define L3_SNAP_MAGIC 0x4c33534e  /* "L3SN" */
-#define L3_SNAP_VERSION 1
+/* v1: guest (snes_saveload) only.  v2: full rollback snapshot, including the
+ * recompiled CpuState / fiber position / interpreter residue, so a loaded
+ * state actually resumes execution. */
+#define L3_SNAP_VERSION 2
 
 static void cmd_save_state(const char *args) {
     char filename[512];
@@ -4322,22 +4332,42 @@ static void cmd_save_state(const char *args) {
         send_fmt("{\"error\":\"usage: save_state <filename>\"}");
         return;
     }
+    // v2 saves the complete rollback snapshot: guest memory/PPU plus the
+    // recompiled CpuState, fiber position, interpreter residue, and RTL
+    // timing state.  Without that tail a loaded "state" is only a picture:
+    // the guest PC/CpuState stays where the loading process left it.
+    size_t bound = RtlRollbackSnapshotBound();
+    unsigned char *buf = (unsigned char *)malloc(bound);
+    if (!buf) {
+        send_fmt("{\"error\":\"out of memory (snapshot bound %zu)\"}", bound);
+        return;
+    }
+    size_t n = RtlRollbackSaveToMemory(buf, bound);
+    if (n == 0) {
+        free(buf);
+        send_fmt("{\"error\":\"snapshot failed (game has no execution state?)\"}");
+        return;
+    }
     FILE *f = fopen(filename, "wb");
     if (!f) {
+        free(buf);
         send_fmt("{\"error\":\"fopen failed: %s\"}", filename);
         return;
     }
     uint32_t magic = L3_SNAP_MAGIC, version = L3_SNAP_VERSION;
+    uint32_t payload = (uint32_t)n;
     fwrite(&magic, 4, 1, f);
     fwrite(&version, 4, 1, f);
-    FileSli fs = {{_file_sli_func, NULL}, f, 1, 0, 0};
-    snes_saveload(g_snes, &fs.sli);
+    fwrite(&payload, 4, 1, f);
+    size_t wrote = fwrite(buf, 1, n, f);
     fclose(f);
-    if (fs.error) {
-        send_fmt("{\"error\":\"write failed after %zu bytes\"}", fs.total);
+    free(buf);
+    if (wrote != n) {
+        send_fmt("{\"error\":\"short write (%zu/%zu)\"}", wrote, n);
         return;
     }
-    send_fmt("{\"ok\":true,\"bytes\":%zu,\"file\":\"%s\"}", fs.total + 8, filename);
+    send_fmt("{\"ok\":true,\"bytes\":%zu,\"file\":\"%s\",\"format\":\"rollback-v2\"}",
+             n + 12, filename);
 }
 
 // ---- L3 harness: minimal-input fixture helpers ----
@@ -4425,6 +4455,528 @@ static void cmd_invoke_recomp(const char *args) {
     send_fmt("{\"error\":\"invoke_recomp disabled in v2 build\"}");
 }
 
+int g_debug_call_active = 0;  /* set while call_func runs a synthetic call */
+
+extern uint32_t GameGetResumePC(void);
+extern void GameSetResumePC(uint32_t pc);
+extern void interp_bridge_set_lle_resume_pc(uint32_t pc);
+/* Game-side frame model (src/game_rtl.c): the chunked LLE call drives the
+ * same NMI/IRQ edges and beam clock as the port's frame driver. */
+extern uint32_t GameNmiVector(void);
+extern uint32_t GameIrqVector(void);
+/* Returns 1 when the handler reached its RTI, 0 on a step-cap bail (the
+ * caller must then contain the partial handler — the interrupt frame is still
+ * on the guest stack). */
+extern int GameRunInterrupt(uint32_t vector, uint64_t frame_end, uint8_t kind);
+extern uint64_t GameFrameEndForCurrentBeam(void);
+extern void GameIdleAdvanceTo(uint64_t master_clock);
+
+static void cmd_get_resume_pc(const char *args) {
+    (void)args;
+    send_fmt("{\"resume_pc\":\"0x%06x\"}", GameGetResumePC());
+}
+
+static void cmd_set_resume_pc(const char *args) {
+    unsigned int pc = 0;
+    if (!args || sscanf(args, "%x", &pc) != 1) {
+        send_fmt("{\"error\":\"usage: set_resume_pc <pc24_hex>\"}");
+        return;
+    }
+    GameSetResumePC(pc);
+    send_fmt("{\"ok\":true,\"resume_pc\":\"0x%06x\"}", GameGetResumePC());
+}
+
+// cpu_state — read the recompiled CpuState (not the legacy Cpu struct).
+static void cmd_cpu_state(const char *args) {
+    (void)args;
+    send_fmt("{\"a\":\"0x%04x\",\"x\":\"0x%04x\",\"y\":\"0x%04x\","
+             "\"s\":\"0x%04x\",\"d\":\"0x%04x\",\"db\":\"0x%02x\","
+             "\"pb\":\"0x%02x\",\"p\":\"0x%02x\",\"m\":%u,\"xflag\":%u}",
+             g_cpu.A, g_cpu.X, g_cpu.Y, g_cpu.S, g_cpu.D, g_cpu.DB,
+             g_cpu.PB, g_cpu.P, g_cpu.m_flag & 1, g_cpu.x_flag & 1);
+}
+
+// set_cpu_state db=7e d=100 m=1 xflag=1 ... — persistent CpuState fields.
+static void cmd_set_cpu_state(const char *args) {
+    const char *p = args;
+    while (*p) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        char key[16];
+        int klen = 0;
+        while (p[klen] && p[klen] != '=' && p[klen] != ' ' &&
+               p[klen] != '\t' && klen < 15) { key[klen] = p[klen]; klen++; }
+        key[klen] = 0;
+        if (p[klen] != '=') break;
+        p += klen + 1;
+        unsigned int val = 0;
+        int nread = 0;
+        if (sscanf(p, "%x%n", &val, &nread) != 1) break;
+        p += nread;
+        if      (strcmp(key, "a") == 0)     g_cpu.A = (uint16)val;
+        else if (strcmp(key, "x") == 0)     g_cpu.X = (uint16)val;
+        else if (strcmp(key, "y") == 0)     g_cpu.Y = (uint16)val;
+        else if (strcmp(key, "s") == 0)     g_cpu.S = (uint16)val;
+        else if (strcmp(key, "d") == 0)     g_cpu.D = (uint16)val;
+        else if (strcmp(key, "db") == 0)    g_cpu.DB = (uint8)val;
+        else if (strcmp(key, "pb") == 0)    g_cpu.PB = (uint8)val;
+        else if (strcmp(key, "m") == 0) {
+            g_cpu.m_flag = (uint8)(val & 1);
+            g_cpu.P = (uint8)((g_cpu.P & ~0x20) | ((val & 1) ? 0x20 : 0));
+        } else if (strcmp(key, "xflag") == 0) {
+            g_cpu.x_flag = (uint8)(val & 1);
+            g_cpu.P = (uint8)((g_cpu.P & ~0x10) | ((val & 1) ? 0x10 : 0));
+        } else {
+            send_fmt("{\"error\":\"unknown cpu_state key: %s\"}", key);
+            return;
+        }
+    }
+    cmd_cpu_state("");
+}
+
+// call_func <pc24_hex> [a=hex] [x=hex] [y=hex] [s=hex] [d=hex] [db=hex]
+//           [pb=hex] [m=0|1] [xflag=0|1] [frame=2|3]
+//
+// Invoke a recompiled function by its 24-bit entry PC while the simulation is
+// parked at a frame boundary.  This is the primitive behind debug warps,
+// battle starts, and battle-BG loads: the game's own routines run against the
+// live WRAM/PPU state, then the command returns to the parked host.
+//
+// `frame` is the return-frame size: 2 for a JSR/RTS routine (default), 3 for
+// a JSL/RTL routine.  The function is entered as a host-paired call so its
+// RTS/RTL host-returns through the frame instead of dispatching on it.
+static void cmd_call_func(const char *args) {
+    unsigned int pc24 = 0;
+    if (!args || sscanf(args, "%x", &pc24) != 1) {
+        send_fmt("{\"error\":\"usage: call_func <pc24_hex> [k=v ...]\"}");
+        return;
+    }
+    if (!s_paused) {
+        send_fmt("{\"error\":\"call_func requires a parked simulation; use step 1 first\","
+                 "\"frame\":%d}", snes_frame_counter);
+        return;
+    }
+    pc24 &= 0xFFFFFFu;
+
+    CpuState saved = g_cpu;
+    int frame = 2;
+    unsigned int source = 0x00FFFFFEu;
+    const char *p = args;
+    while (*p && *p != ' ' && *p != '\t') p++;
+    while (*p) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        char key[16];
+        int klen = 0;
+        while (p[klen] && p[klen] != '=' && p[klen] != ' ' &&
+               p[klen] != '\t' && klen < 15) {
+            key[klen] = p[klen];
+            klen++;
+        }
+        key[klen] = 0;
+        if (p[klen] != '=') break;
+        p += klen + 1;
+        unsigned int val = 0;
+        int nread = 0;
+        if (sscanf(p, "%x%n", &val, &nread) != 1) break;
+        p += nread;
+        if      (strcmp(key, "a") == 0)     g_cpu.A = (uint16)val;
+        else if (strcmp(key, "x") == 0)     g_cpu.X = (uint16)val;
+        else if (strcmp(key, "y") == 0)     g_cpu.Y = (uint16)val;
+        else if (strcmp(key, "s") == 0)     g_cpu.S = (uint16)val;
+        else if (strcmp(key, "d") == 0)     g_cpu.D = (uint16)val;
+        else if (strcmp(key, "db") == 0)    g_cpu.DB = (uint8)val;
+        else if (strcmp(key, "pb") == 0)    g_cpu.PB = (uint8)val;
+        else if (strcmp(key, "m") == 0) {
+            g_cpu.m_flag = (uint8)(val & 1);
+            g_cpu.P = (uint8)((g_cpu.P & ~0x20) | ((val & 1) ? 0x20 : 0));
+        } else if (strcmp(key, "xflag") == 0) {
+            g_cpu.x_flag = (uint8)(val & 1);
+            g_cpu.P = (uint8)((g_cpu.P & ~0x10) | ((val & 1) ? 0x10 : 0));
+        } else if (strcmp(key, "frame") == 0) {
+            frame = (val == 3) ? 3 : 2;
+        } else {
+            send_fmt("{\"error\":\"unknown call_func key: %s\"}", key);
+            g_cpu = saved;
+            return;
+        }
+    }
+
+    // Default the program bank to the routine's bank; leave DB/DP alone
+    // unless the caller supplied them (field routines usually run with DB=$7E).
+    if (g_cpu.PB == saved.PB) g_cpu.PB = (uint8)(pc24 >> 16);
+    g_cpu.host_return_valid = (uint8)frame;
+
+    // Push the return frame ourselves.  The generated prologue reads the
+    // low/high (and bank) bytes at entry_s+1/+2/+3, so leave entry_s one
+    // below the frame exactly like a hardware push.
+    unsigned int ret = (source + frame - 1) & 0xFFFFu;
+    g_cpu.S = (uint16)(g_cpu.S - frame);
+    cpu_write8(&g_cpu, 0, (uint16)(g_cpu.S + 1), (uint8)ret);
+    cpu_write8(&g_cpu, 0, (uint16)(g_cpu.S + 2), (uint8)(ret >> 8));
+    if (frame == 3)
+        cpu_write8(&g_cpu, 0, (uint16)(g_cpu.S + 3), (uint8)(source >> 16));
+
+    uint32 return_pc24 = 0;
+    /* The parked main thread may have left a tail-call context pending.
+     * Swallow it for the duration of this synthetic call, then restore it so
+     * the resumed frame sees exactly the state it parked with. */
+    CpuTailcallContextSave tcs;
+    cpu_tailcall_context_save(&tcs);
+    (void)cpu_take_tailcall_return_context(NULL, NULL);
+    g_debug_call_active = 1;
+    int r = (int)cpu_dispatch_call_pc_pushed(&g_cpu, pc24, source,
+                                             (uint8)frame, &return_pc24);
+    g_debug_call_active = 0;
+    cpu_tailcall_context_restore(&tcs);
+    uint16 out_a = g_cpu.A, out_x = g_cpu.X, out_y = g_cpu.Y;
+    uint16 out_s = g_cpu.S;
+    g_cpu = saved;
+    send_fmt("{\"ok\":true,\"pc\":\"0x%06x\",\"ret\":%d,"
+             "\"frame\":%d,\"a\":\"0x%04x\",\"x\":\"0x%04x\","
+             "\"y\":\"0x%04x\",\"s\":\"0x%04x\",\"return_pc\":\"0x%06x\"}",
+             pc24, r, frame, out_a, out_x, out_y, out_s, return_pc24);
+}
+
+/* Deliver one NMI/IRQ edge through the port's own frame-driver path while a
+ * chunked synthetic call owns the guest. If the handler bails at the
+ * interpreter step cap it never reached its RTI, so its interrupt frame is
+ * still on the guest stack: restore the interrupted CPU state (keeping the
+ * clock advance — time really did pass) instead of letting the truncated
+ * handler corrupt the routine under test. */
+static int lle_call_deliver_interrupt(uint32_t vector, uint64_t frame_end,
+                                      uint8_t kind)
+{
+    CpuState before = g_cpu;
+    /* The handler pushes its frame (and its own calls) BELOW the interrupted
+     * stack pointer. Snapshot that window so a handler that bails before its
+     * RTI cannot leave its partial frames sitting in the caller's stack. */
+    enum { LLE_IRQ_STACK_SAVE = 256 };
+    uint8 stack_save[LLE_IRQ_STACK_SAVE];
+    for (int i = 0; i < LLE_IRQ_STACK_SAVE; i++)
+        stack_save[i] = cpu_read8(&g_cpu, 0,
+                                  (uint16)(before.S - LLE_IRQ_STACK_SAVE + i));
+    const int ok = GameRunInterrupt(vector, frame_end, kind);
+    if (!ok) {
+        const uint64_t mc = g_cpu.master_cycles;
+        const uint64_t cyc = g_cpu.cycles;
+        g_cpu = before;
+        g_cpu.master_cycles = mc;
+        g_cpu.cycles = cyc;
+        for (int i = 0; i < LLE_IRQ_STACK_SAVE; i++)
+            cpu_write8(&g_cpu, 0,
+                       (uint16)(before.S - LLE_IRQ_STACK_SAVE + i),
+                       stack_save[i]);
+    }
+    return ok;
+}
+
+// ── call_func_lle / call_func_lle_frames ─────────────────────────────────
+//
+// LLE (interpreter) call path for routines that have no AOT dispatch row.
+// Mirrors call_func's save/restore of g_cpu and the tail-call context, but
+// enters the routine through the interpreter bridge with a pushed return
+// frame, so its RTS/RTL pops that frame and the bridge exits on the sentinel
+// return instead of re-dispatching through the wrong bank. g_resume_pc is
+// temporarily set to pc24 and restored afterwards, so a parked frame is not
+// corrupted.
+//
+// Two modes:
+//   call_func_lle        — one synchronous run (self-contained routines).
+//   call_func_lle_frames — CHUNKED run: the routine is executed in
+//                          deadline-bounded slices, one guest frame each, and
+//                          the NMI/IRQ edges the frame driver would deliver
+//                          are delivered between slices. This is what lets a
+//                          routine that polls a frame-driven flag (e.g.
+//                          BattleBg_LoadAndStartScene waiting on $CD02) make
+//                          progress: the main thread is parked, so nothing
+//                          else can deliver the interrupt while we run.
+//
+// Keys: a= x= y= s= d= db= pb= m= xflag= frame=2|3|auto
+//       call_func_lle_frames also: frames=N (guest frames to allow, default
+//       60, max 600).
+//
+// frame=auto (the default for the chunked command) pushes a 3-byte JSL frame
+// and accepts either return: a JSR/RTS routine pops the 2-byte return address
+// and exits on the stack watermark, while an RTL routine also pops the bank
+// byte. The interpreter's slice exit additionally requires the popped PC to
+// BE the pushed sentinel, so an internal RTL inside a JSR helper cannot end
+// the call early.
+static void call_func_lle_impl(const char *args, int chunked) {
+    unsigned int pc24 = 0;
+    if (!args || sscanf(args, "%x", &pc24) != 1) {
+        send_fmt("{\"error\":\"usage: %s <pc24_hex> [k=v ...]%s\"}",
+                 chunked ? "call_func_lle_frames" : "call_func_lle",
+                 chunked ? " [frames=N]" : "");
+        return;
+    }
+    if (!s_paused) {
+        send_fmt("{\"error\":\"%s requires a parked simulation; use step 1 first\","
+                 "\"frame\":%d}",
+                 chunked ? "call_func_lle_frames" : "call_func_lle",
+                 snes_frame_counter);
+        return;
+    }
+    pc24 &= 0xFFFFFFu;
+
+    CpuState saved = g_cpu;
+    int frame = chunked ? 0 : 2;   /* 0 = auto (push 3, accept RTS or RTL) */
+    int max_frames = 60;
+    int allow_nmi = 1, allow_irq = 1;
+    unsigned int source = 0x00FFFFFEu;
+    const char *p = args;
+    while (*p && *p != ' ' && *p != '\t') p++;
+    while (*p) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        char key[16];
+        int klen = 0;
+        while (p[klen] && p[klen] != '=' && p[klen] != ' ' &&
+               p[klen] != '\t' && klen < 15) {
+            key[klen] = p[klen];
+            klen++;
+        }
+        key[klen] = 0;
+        if (p[klen] != '=') break;
+        p += klen + 1;
+        /* `frames` is a plain decimal count (frames=120 is 120, not 0x120);
+         * everything else is hexadecimal like the other register keys. */
+        if (strcmp(key, "frames") == 0) {
+            char *end = NULL;
+            long n = strtol(p, &end, 10);
+            if (end == p) break;
+            max_frames = (n <= 0) ? 1 : (int)n;
+            if (max_frames > 600) max_frames = 600;
+            p = end;
+            continue;
+        }
+        unsigned int val = 0;
+        int nread = 0;
+        if (sscanf(p, "%x%n", &val, &nread) != 1) {
+            /* frame=auto is not hex. */
+            if (strcmp(key, "frame") == 0 && strncmp(p, "auto", 4) == 0) {
+                frame = 0;
+                p += 4;
+                continue;
+            }
+            break;
+        }
+        p += nread;
+        if      (strcmp(key, "nmi") == 0)   allow_nmi = (val != 0);
+        else if (strcmp(key, "irq") == 0)   allow_irq = (val != 0);
+        else if (strcmp(key, "a") == 0)     g_cpu.A = (uint16)val;
+        else if (strcmp(key, "x") == 0)     g_cpu.X = (uint16)val;
+        else if (strcmp(key, "y") == 0)     g_cpu.Y = (uint16)val;
+        else if (strcmp(key, "s") == 0)     g_cpu.S = (uint16)val;
+        else if (strcmp(key, "d") == 0)     g_cpu.D = (uint16)val;
+        else if (strcmp(key, "db") == 0)    g_cpu.DB = (uint8)val;
+        else if (strcmp(key, "pb") == 0)    g_cpu.PB = (uint8)val;
+        else if (strcmp(key, "m") == 0) {
+            g_cpu.m_flag = (uint8)(val & 1);
+            g_cpu.P = (uint8)((g_cpu.P & ~0x20) | ((val & 1) ? 0x20 : 0));
+        } else if (strcmp(key, "xflag") == 0) {
+            g_cpu.x_flag = (uint8)(val & 1);
+            g_cpu.P = (uint8)((g_cpu.P & ~0x10) | ((val & 1) ? 0x10 : 0));
+        } else if (strcmp(key, "frame") == 0) {
+            frame = (val == 3) ? 3 : 2;
+        } else {
+            send_fmt("{\"error\":\"unknown %s key: %s\"}",
+                     chunked ? "call_func_lle_frames" : "call_func_lle", key);
+            g_cpu = saved;
+            return;
+        }
+    }
+
+    if (g_cpu.PB == saved.PB) g_cpu.PB = (uint8)(pc24 >> 16);
+    const int push_bytes = (frame == 0) ? 3 : frame;
+    g_cpu.host_return_valid = (uint8)push_bytes;
+
+    /* The parked frame's stack window must be byte-identical afterwards: the
+     * synthetic frame (and whatever the routine pushes) lands below S. */
+    const uint16_t stack_s0 = g_cpu.S;
+    uint8 stack_save[16];
+    for (int i = 0; i < 16; i++)
+        stack_save[i] = cpu_read8(&g_cpu, 0, (uint16)(stack_s0 - 16 + i));
+
+    unsigned int ret = (source + push_bytes - 1) & 0xFFFFu;
+    g_cpu.S = (uint16)(g_cpu.S - push_bytes);
+    cpu_write8(&g_cpu, 0, (uint16)(g_cpu.S + 1), (uint8)ret);
+    cpu_write8(&g_cpu, 0, (uint16)(g_cpu.S + 2), (uint8)(ret >> 8));
+    if (push_bytes == 3)
+        cpu_write8(&g_cpu, 0, (uint16)(g_cpu.S + 3), (uint8)(source >> 16));
+
+    CpuTailcallContextSave tcs;
+    cpu_tailcall_context_save(&tcs);
+    (void)cpu_take_tailcall_return_context(NULL, NULL);
+    g_debug_call_active = 1;
+
+    uint32_t parked_resume = GameGetResumePC();
+    uint32_t parked_bridge_resume = interp_bridge_lle_resume_pc();
+    GameSetResumePC(pc24);
+    interp_bridge_set_lle_resume_pc(pc24);
+    interp_bridge_set_master_deadline(0);
+
+    int r = 0;
+    int completed = 0;
+    int frames_used = 0;
+    int slices_used = 0;
+    static int s_lle_call_trace = -1;
+    if (s_lle_call_trace < 0)
+        s_lle_call_trace = getenv("SNESRECOMP_LLE_CALL_TRACE") ? 1 : 0;
+    int s_lle_call_ring_dumped = 0;
+    int nmis = 0;
+    int irqs = 0;
+    int irq_bails = 0;
+    int nmi_bails = 0;
+    uint32_t out_return = 0;
+    uint32_t cur = pc24;
+
+    if (!chunked) {
+        r = interp_bridge_run(&g_cpu, pc24);
+        completed = (r == 1);
+    } else {
+        const uint16_t watermark = g_cpu.S;   /* just below the pushed frame */
+        const int max_slices = 64;
+        for (frames_used = 0; frames_used < max_frames && !completed;
+             frames_used++) {
+            const uint64_t frame_end = GameFrameEndForCurrentBeam();
+            int nmi_done = 0;
+            for (int slice = 0; slice < max_slices; slice++) {
+                if (g_cpu.master_cycles >= frame_end) break;
+                interp_bridge_set_master_deadline(frame_end);
+                out_return = 0;
+                r = interp_bridge_run_slice(&g_cpu, cur, watermark,
+                                            (uint16_t)ret, &out_return);
+                interp_bridge_set_master_deadline(0);
+                slices_used++;
+                if (out_return) { completed = 1; break; }
+                uint32_t resume = interp_bridge_lle_resume_pc();
+                if (resume) cur = resume;
+                const int wai = interp_bridge_lle_took_wai();
+                /* Containment diagnostic: a synthetic call must keep its
+                 * stack inside the frame it was given. A large excursion means
+                 * the routine (or an interrupt it took) unbalanced the stack;
+                 * dump the interpreter's step ring once so the jump is
+                 * visible. */
+                if (s_lle_call_trace && !s_lle_call_ring_dumped &&
+                    (int)(int16_t)(g_cpu.S - watermark) < -96) {
+                    s_lle_call_ring_dumped = 1;
+                    fprintf(stderr, "[lle_call] stack excursion S=$%04X "
+                            "watermark=$%04X at cur=$%06X\n",
+                            (unsigned)g_cpu.S, (unsigned)watermark,
+                            (unsigned)cur);
+                    interp_bridge_dump_recent_steps(4000, stderr);
+                }
+                if (s_lle_call_trace && slices_used <= 48)
+                    fprintf(stderr, "[lle_call] f=%d slice=%d r=%d "
+                            "cur=$%06X S=$%04X mcyc=%llu wai=%d vbl=%d irq=%d "
+                            "cd02=%02X ca20=%02X 7e=%02X\n",
+                            frames_used, slice, r, (unsigned)cur,
+                            (unsigned)g_cpu.S,
+                            (unsigned long long)g_cpu.master_cycles, wai,
+                            (int)g_snes->inVblank, (int)g_snes->inIrq,
+                            g_ram[0xCD02], g_ram[0xCA20], g_ram[0x7E]);
+                (void)interp_bridge_lle_took_quiescent();
+
+                /* A raster IRQ asserted while the guest ran: service it
+                 * before continuing, exactly as the CPU samples it between
+                 * instructions. */
+                if (allow_irq && g_snes->inIrq && !g_cpu._flag_I) {
+                    GameSetResumePC(cur);
+                    if (!lle_call_deliver_interrupt(GameIrqVector(), frame_end, 2))
+                        irq_bails++;
+                    irqs++;
+                    /* A handler that bails every time cannot make progress;
+                     * stop spending the step cap on it (reported). */
+                    if (irq_bails >= 3) allow_irq = 0;
+                    continue;
+                }
+                /* WAI: the CPU is halted until an interrupt. Nothing executes
+                 * during the wait, so walk the beam to this frame's vblank
+                 * edge and deliver the NMI there. */
+                if (wai) {
+                    GameIdleAdvanceTo(frame_end);
+                    if (allow_nmi && !nmi_done && g_snes->nmiEnabled &&
+                        g_snes->inVblank) {
+                        GameSetResumePC(cur);
+                        g_snes->inNmi = true;
+                        if (!lle_call_deliver_interrupt(GameNmiVector(),
+                                                        frame_end, 1))
+                            nmi_bails++;
+                        if (nmi_bails >= 3) allow_nmi = 0;
+                        g_snes->inNmi = false;
+                        nmis++;
+                        nmi_done = 1;
+                    }
+                    continue;
+                }
+                /* NMI at the vblank edge (one per guest frame, like the frame
+                 * driver). */
+                if (allow_nmi && !nmi_done && g_snes->nmiEnabled &&
+                    g_snes->inVblank) {
+                    GameSetResumePC(cur);
+                    g_snes->inNmi = true;
+                    if (!lle_call_deliver_interrupt(GameNmiVector(),
+                                                    frame_end, 1))
+                        nmi_bails++;
+                    if (nmi_bails >= 3) allow_nmi = 0;
+                    g_snes->inNmi = false;
+                    nmis++;
+                    nmi_done = 1;
+                    continue;
+                }
+                if (g_cpu.master_cycles >= frame_end) break;
+            }
+        }
+    }
+
+    g_debug_call_active = 0;
+    cpu_tailcall_context_restore(&tcs);
+    uint32_t after_bridge_resume = interp_bridge_lle_resume_pc();
+    GameSetResumePC(parked_resume);
+    interp_bridge_set_lle_resume_pc(parked_bridge_resume);
+    interp_bridge_set_master_deadline(0);
+    for (int i = 0; i < 16; i++)
+        cpu_write8(&g_cpu, 0, (uint16)(stack_s0 - 16 + i), stack_save[i]);
+
+    const int return_op = chunked ? interp_bridge_lle_slice_return_op() : 0;
+    const int out_s_delta = (int)(uint16_t)(g_cpu.S - stack_s0);
+    uint16 out_a = g_cpu.A, out_x = g_cpu.X, out_y = g_cpu.Y;
+    uint16 out_s = g_cpu.S;
+    uint32_t return_pc24 = completed ? out_return : after_bridge_resume;
+    /* Time is not part of the parked frame's register state: the beam really
+     * advanced by the guest frames this call consumed, so the master clock
+     * must not be rolled back with the registers. */
+    const uint64_t final_mc = g_cpu.master_cycles;
+    const uint64_t final_cyc = g_cpu.cycles;
+    g_cpu = saved;
+    if (chunked) {
+        g_cpu.master_cycles = final_mc;
+        g_cpu.cycles = final_cyc;
+    }
+    const uint64_t reported_mc = g_cpu.master_cycles;
+    send_fmt("{\"ok\":true,\"pc\":\"0x%06x\",\"ret\":%d,\"completed\":%s,"
+             "\"frame\":%d,\"frames_used\":%d,\"slices\":%d,\"nmi\":%d,"
+             "\"irq\":%d,\"nmi_bails\":%d,\"irq_bails\":%d,"
+             "\"return_op\":\"0x%02x\",\"s_delta\":%d,\"mc_after\":%llu,"
+             "\"a\":\"0x%04x\",\"x\":\"0x%04x\","
+             "\"y\":\"0x%04x\",\"s\":\"0x%04x\",\"return_pc\":\"0x%06x\","
+             "\"bridge_resume\":\"0x%06x\",\"parked_resume\":\"0x%06x\"}",
+             pc24, r, completed ? "true" : "false", push_bytes, frames_used,
+             slices_used, nmis, irqs, nmi_bails, irq_bails, return_op,
+             out_s_delta, (unsigned long long)reported_mc,
+             out_a, out_x, out_y, out_s, return_pc24,
+             after_bridge_resume, parked_resume);
+}
+
+static void cmd_call_func_lle(const char *args) {
+    call_func_lle_impl(args, 0);
+}
+
+static void cmd_call_func_lle_frames(const char *args) {
+    call_func_lle_impl(args, 1);
+}
+
 static void cmd_load_state(const char *args) {
     char filename[512];
     if (sscanf(args, "%500s", filename) != 1) {
@@ -4442,11 +4994,45 @@ static void cmd_load_state(const char *args) {
         send_fmt("{\"error\":\"bad magic: expected L3 snapshot\"}");
         return;
     }
-    if (fread(&version, 4, 1, f) != 1 || version != L3_SNAP_VERSION) {
+    if (fread(&version, 4, 1, f) != 1 || (version != 1 && version != 2)) {
         fclose(f);
-        send_fmt("{\"error\":\"bad version: got %u want %u\"}", version, L3_SNAP_VERSION);
+        send_fmt("{\"error\":\"bad version: got %u want 1 or 2\"}", version);
         return;
     }
+    if (version == 2) {
+        uint32_t payload = 0;
+        if (fread(&payload, 4, 1, f) != 1 || payload == 0 ||
+            payload > (1u << 24)) {
+            fclose(f);
+            send_fmt("{\"error\":\"bad v2 payload length\"}");
+            return;
+        }
+        unsigned char *buf = (unsigned char *)malloc(payload);
+        if (!buf) {
+            fclose(f);
+            send_fmt("{\"error\":\"out of memory (payload %u)\"}", payload);
+            return;
+        }
+        size_t got = fread(buf, 1, payload, f);
+        fclose(f);
+        if (got != payload) {
+            free(buf);
+            send_fmt("{\"error\":\"short read (%zu/%u)\"}", got, payload);
+            return;
+        }
+        bool ok = RtlRollbackLoadFromMemory(buf, payload);
+        free(buf);
+        if (!ok) {
+            send_fmt("{\"error\":\"rollback load rejected (bad residue/exec state)\"}");
+            return;
+        }
+        PpuResetWidescreenOamHistory(g_snes->ppu);
+        send_fmt("{\"ok\":true,\"bytes\":%u,\"file\":\"%s\",\"format\":\"rollback-v2\"}",
+                 payload + 12, filename);
+        return;
+    }
+    // Legacy v1: guest/PPU only; execution position is NOT restored.  Kept
+    // so old asset-capture fixtures still load for inspection.
     FileSli fs = {{_file_sli_func, NULL}, f, 0, 0, 0};
     snes_saveload(g_snes, &fs.sli);
     fclose(f);
@@ -4455,7 +5041,38 @@ static void cmd_load_state(const char *args) {
         return;
     }
     PpuResetWidescreenOamHistory(g_snes->ppu);
-    send_fmt("{\"ok\":true,\"bytes\":%zu,\"file\":\"%s\"}", fs.total + 8, filename);
+    send_fmt("{\"ok\":true,\"bytes\":%zu,\"file\":\"%s\",\"format\":\"legacy-v1\","
+             "\"warning\":\"guest only; execution position not restored\"}",
+             fs.total + 8, filename);
+}
+
+// write_cart <rom_offset_hex> <hex_bytes> — live debug patch of the in-memory
+// cartridge image. Used only by the cheat/debug tooling; never writes files.
+static void cmd_write_cart(const char *args) {
+    unsigned int addr = 0;
+    if (!args || sscanf(args, "%x", &addr) != 1) {
+        send_fmt("{\"error\":\"usage: write_cart <rom_offset_hex> <hex_bytes>\"}");
+        return;
+    }
+    if (!g_snes || !g_snes->cart || !g_snes->cart->rom) {
+        send_fmt("{\"error\":\"cart rom unavailable\"}");
+        return;
+    }
+    const char *p = args;
+    while (*p && *p != ' ' && *p != '\t') p++;
+    while (*p == ' ' || *p == '\t') p++;
+    uint32_t rom_size = g_snes->cart->romSize;
+    int count = 0;
+    while (p[0] && p[1] && addr + count < rom_size) {
+        int hi = _hex_nibble(p[0]);
+        int lo = _hex_nibble(p[1]);
+        if (hi < 0 || lo < 0) break;
+        g_snes->cart->rom[addr + count] = (uint8_t)((hi << 4) | lo);
+        count++;
+        p += 2;
+        while (*p == ' ' || *p == '\t') p++;
+    }
+    send_fmt("{\"ok\":true,\"addr\":\"0x%x\",\"count\":%d}", addr, count);
 }
 
 static void cmd_get_frame(const char *args) {
@@ -8690,6 +9307,13 @@ static const CmdEntry s_commands[] = {
     {"save_state",    cmd_save_state},
     {"load_state",    cmd_load_state},
     {"invoke_recomp", cmd_invoke_recomp},
+    {"call_func",     cmd_call_func},
+    {"call_func_lle", cmd_call_func_lle},
+    {"call_func_lle_frames", cmd_call_func_lle_frames},
+    {"cpu_state",     cmd_cpu_state},
+    {"set_cpu_state", cmd_set_cpu_state},
+    {"get_resume_pc", cmd_get_resume_pc},
+    {"set_resume_pc", cmd_set_resume_pc},
     {"write_ram",     cmd_write_ram},
     {"zero_ram",      cmd_zero_ram},
     {"set_cpu",       cmd_set_cpu},
@@ -8750,6 +9374,7 @@ static const CmdEntry s_commands[] = {
     {"trace_range",   cmd_trace_range},
     {"get_trace_range", cmd_get_trace_range},
     {"get_frame",     cmd_get_frame},
+    {"write_cart",    cmd_write_cart},
     {"frame_range",   cmd_frame_range},
     {"history",       cmd_history_status},
     {"wram_timeseries", cmd_wram_timeseries},
