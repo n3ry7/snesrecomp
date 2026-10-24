@@ -3267,6 +3267,35 @@ static void RunInGameLauncher(bool *running, const char **exit_reason) {
 #endif
 }
 
+/* One side of the `[quickstate] cycle:` line: the pad slot and/or keyboard
+ * key currently carrying `cmd`. The pad scan covers L3/R3, L4/R4 and any
+ * `button:N` override, so the line is truthful after a rebind. The keyboard
+ * side checks the default bracket only; the `[keymap] PrevState/NextState`
+ * lines above it are the authority for a custom key. */
+static void QuickStateBindingLabel(int cmd, SDL_Keycode key, char *out,
+                                   size_t out_size) {
+  char pad[32] = "";
+  for (int b = 0; b < kGamepadBtn_Count && !pad[0]; b++)
+    if (FindCmdForGamepadButton(b, 0) == cmd) {
+      const char *pn = GamepadLogicalName(b);
+      snprintf(pad, sizeof(pad), "%s", pn ? pn : "?");
+    }
+  for (int b = kGamepadBtn_ButtonBase;
+       b < kGamepadBtn_Slots && !pad[0]; b++)
+    if (FindCmdForGamepadButton(b, 0) == cmd)
+      snprintf(pad, sizeof(pad), "button:%d", b - kGamepadBtn_ButtonBase);
+  int kbd = FindCmdForSdlKey(key, 0) == cmd;
+  if (pad[0] && kbd)
+    snprintf(out, out_size, "%s (pad) or %s (keyboard)", pad,
+             SDL_GetKeyName(key));
+  else if (pad[0])
+    snprintf(out, out_size, "%s (pad)", pad);
+  else if (kbd)
+    snprintf(out, out_size, "%s (keyboard)", SDL_GetKeyName(key));
+  else
+    snprintf(out, out_size, "(unbound)");
+}
+
 int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **argv) {
   if (!game || !game->game_info || !game->display_name) {
     fprintf(stderr, "snesrecomp_desktop_main: descriptor needs display_name and game_info\n");
@@ -3430,10 +3459,16 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
       int l2 = FindCmdForGamepadButton(kGamepadBtn_L2, 0);
       int l4 = FindCmdForGamepadButton(kGamepadBtn_L4, 0);
       int r4 = FindCmdForGamepadButton(kGamepadBtn_R4, 0);
+      int l3 = FindCmdForGamepadButton(kGamepadBtn_L3, 0);
+      int r3 = FindCmdForGamepadButton(kGamepadBtn_R3, 0);
       fprintf(stderr, "[gamemap] P1 R2 -> %s\n",
               r2 == kKeys_QuickSave ? "QuickSave" : r2 ? "other" : "(unbound)");
       fprintf(stderr, "[gamemap] P1 L2 -> %s\n",
               l2 == kKeys_QuickLoad ? "QuickLoad" : l2 ? "other" : "(unbound)");
+      fprintf(stderr, "[gamemap] P1 L3 -> %s\n",
+              l3 == kKeys_PrevQuickState ? "PrevState" : l3 ? "other" : "(unbound)");
+      fprintf(stderr, "[gamemap] P1 R3 -> %s\n",
+              r3 == kKeys_NextQuickState ? "NextState" : r3 ? "other" : "(unbound)");
       fprintf(stderr, "[gamemap] P1 L4 -> %s\n",
               l4 == kKeys_PrevQuickState ? "PrevState" : l4 ? "other" : "(unbound)");
       fprintf(stderr, "[gamemap] P1 R4 -> %s\n",
@@ -3449,6 +3484,15 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
                            cmd == kKeys_QuickLoad ? "QuickLoad" : "other";
         fprintf(stderr, "[gamemap] P1 button:%d -> %s\n", n, name);
       }
+      {
+        char pv[96], nx[96];
+        QuickStateBindingLabel(kKeys_PrevQuickState, SDLK_LEFTBRACKET, pv,
+                               sizeof(pv));
+        QuickStateBindingLabel(kKeys_NextQuickState, SDLK_RIGHTBRACKET, nx,
+                               sizeof(nx));
+        fprintf(stderr, "[quickstate] cycle: PrevState=%s; NextState=%s\n",
+                pv, nx);
+      }
     }
   }
   if (ConfigKeyMapMigrated()) {
@@ -3462,6 +3506,16 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
     host_report_breadcrumb("config: GamepadDeadzone moved from the former default "
                            "10000 (30%%) to %d (10%%) (rewriting config.ini)",
                            SNES_CONFIG_DEFAULT_DEADZONE);
+    WriteConfigFile(config_file);
+  }
+  if (ConfigQuickStateBindingsMissing()) {
+    /* An install from before stash cycling has no PrevState/NextState lines,
+     * so the player can neither discover nor rebind them. Append the missing
+     * ones (L3/R3, brackets); WriteConfigFile leaves every explicit value
+     * byte-for-byte alone. Once written, the next launch parses them and this
+     * branch is inert. */
+    host_report_breadcrumb("config: added missing quick-state PrevState/NextState "
+                           "bindings (L3/R3, Left/Right Bracket)");
     WriteConfigFile(config_file);
   }
   host_report_breadcrumb(
@@ -5000,9 +5054,28 @@ static void HandleGamepadInput(GamepadInfo *gi, int button, bool pressed) {
   if (!!(gi->modifiers & bit) == pressed)
     return;
   gi->modifiers ^= bit;
-  if (pressed)
-    gi->last_cmd[button] = FindCmdForGamepadButton(
-        button + gi->index * kGamepadBtn_Slots, gi->modifiers);
+  if (pressed) {
+    int cmd = FindCmdForGamepadButton(button + gi->index * kGamepadBtn_Slots,
+                                      gi->modifiers);
+    /* L3/R3 now carry PrevState/NextState. The host's pad gestures already
+     * own Back+click (default rewind is Select+R3, launcher Select+L3), so a
+     * plain cycle binding must not also fire while Back is held. Only the
+     * unmodified binding is suppressed: an explicit `NextState = Back+R3`
+     * has no modifier-0 entry and still works. */
+    if ((cmd == kKeys_PrevQuickState || cmd == kKeys_NextQuickState) &&
+        (gi->modifiers & (1ull << kGamepadBtn_Back)) &&
+        FindCmdForGamepadButton(button + gi->index * kGamepadBtn_Slots, 0) == cmd)
+      cmd = 0;
+    if (GamepadProbeEnabled()) {
+      int lookup = button + gi->index * kGamepadBtn_Slots;
+      fprintf(stderr, "[gamepad_probe] logical %d (player %u, slot %d) -> cmd %d "
+                      "cmd0=%d modifiers=0x%llx\n",
+              button, (unsigned)gi->index + 1, lookup, cmd,
+              FindCmdForGamepadButton(lookup, 0),
+              (unsigned long long)gi->modifiers);
+    }
+    gi->last_cmd[button] = (uint16)cmd;
+  }
   if (gi->last_cmd[button] != 0)
     SetPadButtonOrFallthrough(gi->last_cmd[button], pressed);
 }
@@ -5182,12 +5255,13 @@ static const char kDefaultConfigIniContent[] =
   "ControlsP2 = DpadUp, DpadDown, DpadLeft, DpadRight, Back, Start, B, A, Y, X, Lb, Rb\n"
   "\n"
   "# Player 1's analog triggers: R2 quick-saves, L2 loads the selected\n"
-  "# snapshot. The back paddles step the stash (L4 older, R4 newer); a\n"
-  "# controller whose back buttons SDL reports by number can bind button:N.\n"
+  "# snapshot. Stick clicks step the stash (L3 older, R3 newer); pads whose\n"
+  "# back paddles SDL exposes can use L4/R4, and a pad whose back buttons SDL\n"
+  "# reports by number can bind button:N.\n"
   "QuickSave = R2\n"
   "QuickLoad = L2\n"
-  "PrevState = L4\n"
-  "NextState = R4\n";
+  "PrevState = L3\n"
+  "NextState = R3\n";
 
 static const char *DefaultConfigIni(void) {
   if (g_game->default_config_ini) return g_game->default_config_ini;

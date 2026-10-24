@@ -28,6 +28,15 @@ static bool s_keymap_migrated;
 bool ConfigKeyMapMigrated(void) { return s_keymap_migrated; }
 static bool s_deadzone_migrated;
 bool ConfigDeadzoneMigrated(void) { return s_deadzone_migrated; }
+/* Which of the four quick-state cycle bindings the config files actually
+ * named. Bits: 0 [KeyMap] PrevState, 1 [KeyMap] NextState, 2 [GamepadMap]
+ * PrevState, 3 [GamepadMap] NextState. A missing key is appended by
+ * WriteConfigFile once, with the machine default, so an install from before
+ * the feature gets visible, editable lines. */
+static uint8 s_cycle_bindings_seen;
+bool ConfigQuickStateBindingsMissing(void) {
+  return (s_cycle_bindings_seen & 0xf) != 0xf;
+}
 /* Set per player when [Controller] SourceP1/SourceP2 was actually present. */
 static bool s_player_src_seen[2];
 /* [Rewind] is written only for a host that offers the launcher rows, so a
@@ -372,7 +381,11 @@ static void ParseGamepadArray(int gamepad, char *value, int cmd, int size) {
   char *s;
   int i = 0;
   for (; i < size && (s = NextDelim(&value, ',')) != NULL; i++, cmd += (cmd != 0)) {
-    if (*s == 0)
+    /* "None" / "(unbound)" is how a player clears a binding; accept the same
+     * spellings ParseKeyArray does so a deliberate unbind is not reported as
+     * an unknown button (and is not re-added by the cycle migration). */
+    if (*s == 0 || StringEqualsNoCase(s, "None") ||
+        StringEqualsNoCase(s, "(unbound)"))
       continue;
     int gamepad_cur = gamepad;
     uint64 modifiers = 0;
@@ -420,13 +433,15 @@ static void RegisterDefaultKeys(void) {
     GamepadMap_Add(kGamepadBtn_R2, 0, kKeys_QuickSave);
     GamepadMap_Add(kGamepadBtn_L2, 0, kKeys_QuickLoad);
   }
-  /* The stash-selection pair on the back paddles. Same reasoning as the
-   * triggers: no existing config.ini names them, so they are registered here
-   * rather than in the Controls block (which upgrades skip). */
+  /* The stash-selection pair. The 8BitDo Ultimate 2 reports no SDL paddles,
+   * so L4/R4 can never fire on it; L3/R3 are the stick clicks, which the SNES
+   * pad does not use and every mapped controller has. Devices that DO expose
+   * paddles can still bind L4/R4 explicitly -- [GamepadMap] naming either key
+   * suppresses only that key's default (see s_state_cycle_gamepad_seen). */
   if (!(s_state_cycle_gamepad_seen & 1))
-    GamepadMap_Add(kGamepadBtn_L4, 0, kKeys_PrevQuickState);
+    GamepadMap_Add(kGamepadBtn_L3, 0, kKeys_PrevQuickState);
   if (!(s_state_cycle_gamepad_seen & 2))
-    GamepadMap_Add(kGamepadBtn_R4, 0, kKeys_NextQuickState);
+    GamepadMap_Add(kGamepadBtn_R3, 0, kKeys_NextQuickState);
 }
 
 static int GetIniSection(const char *s) {
@@ -503,6 +518,8 @@ static bool HandleIniConfig(int section, const char *key, char *value) {
     for (int i = 0; i < countof(kKeyNameId); i++) {
       if (StringEqualsNoCase(key, kKeyNameId[i].name)) {
         has_keynameid[i] = true;
+        if (kKeyNameId[i].id == kKeys_PrevQuickState) s_cycle_bindings_seen |= 1;
+        if (kKeyNameId[i].id == kKeys_NextQuickState) s_cycle_bindings_seen |= 2;
         ParseKeyArray(value, kKeyNameId[i].id, kKeyNameId[i].size);
         return true;
       }
@@ -533,8 +550,14 @@ static bool HandleIniConfig(int section, const char *key, char *value) {
           has_assigned_joypad_controls |= (id == kKeys_Controls) ? 1 : (id == kKeys_ControlsP2) ? 2 : 0;
           if (id == kKeys_QuickSave || id == kKeys_QuickLoad)
             s_quick_gamepad_seen = true;
-          if (id == kKeys_PrevQuickState) s_state_cycle_gamepad_seen |= 1;
-          if (id == kKeys_NextQuickState) s_state_cycle_gamepad_seen |= 2;
+          if (id == kKeys_PrevQuickState) {
+            s_state_cycle_gamepad_seen |= 1;
+            s_cycle_bindings_seen |= 4;
+          }
+          if (id == kKeys_NextQuickState) {
+            s_state_cycle_gamepad_seen |= 2;
+            s_cycle_bindings_seen |= 8;
+          }
           ParseGamepadArray(id == kKeys_ControlsP2 ? 1 : 0, value, kKeyNameId[i].id, kKeyNameId[i].size);
           return true;
         }
@@ -869,9 +892,9 @@ void ConfigReloadGamepadMap(const char *filename) {
     GamepadMap_Add(kGamepadBtn_L2, 0, kKeys_QuickLoad);
   }
   if (!(s_state_cycle_gamepad_seen & 1))
-    GamepadMap_Add(kGamepadBtn_L4, 0, kKeys_PrevQuickState);
+    GamepadMap_Add(kGamepadBtn_L3, 0, kKeys_PrevQuickState);
   if (!(s_state_cycle_gamepad_seen & 2))
-    GamepadMap_Add(kGamepadBtn_R4, 0, kKeys_NextQuickState);
+    GamepadMap_Add(kGamepadBtn_R3, 0, kKeys_NextQuickState);
 }
 
 /* ---------------------------------------------------------------------------
@@ -883,6 +906,9 @@ typedef struct CfgKV {
   const char *section, *key;
   char        val[600];
   int         done;
+  /* 1 = a default that is appended only when the file has no such key; an
+   * existing line is preserved byte-for-byte and never replaced. */
+  int         insert_only;
 } CfgKV;
 
 typedef struct CfgBuf { char *p; size_t len, cap; } CfgBuf;
@@ -987,6 +1013,12 @@ void WriteConfigFile(const char *filename) {
      * player's, and left exactly as written. */
     { "KeyMap",     "VolumeUp" },
     { "KeyMap",     "VolumeDown" },
+    /* Appended only when the config files never named them (an install from
+     * before stash cycling). An explicit value is left exactly as written. */
+    { "KeyMap",     "PrevState", "", 0, 1 },
+    { "KeyMap",     "NextState", "", 0, 1 },
+    { "GamepadMap", "PrevState", "", 0, 1 },
+    { "GamepadMap", "NextState", "", 0, 1 },
   };
   const int N = (int)countof(kvs);
   CfgSet(kvs, N, "Graphics", "WindowScale", "%d",
@@ -1037,6 +1069,26 @@ void WriteConfigFile(const char *filename) {
     CfgSkip(kvs, N, "KeyMap", "VolumeUp");
     CfgSkip(kvs, N, "KeyMap", "VolumeDown");
   }
+  /* Quick-state cycling. When the config never named a binding, give the
+   * player the machine-readable line so it can be discovered and edited.
+   * Present values are never touched (CfgSkip + insert_only). Once both
+   * sections name both keys, later launches parse them and this branch only
+   * skips. */
+  if (ConfigQuickStateBindingsMissing()) {
+    if (s_cycle_bindings_seen & 1) CfgSkip(kvs, N, "KeyMap", "PrevState");
+    else CfgSet(kvs, N, "KeyMap", "PrevState", "%s", "Left Bracket");
+    if (s_cycle_bindings_seen & 2) CfgSkip(kvs, N, "KeyMap", "NextState");
+    else CfgSet(kvs, N, "KeyMap", "NextState", "%s", "Right Bracket");
+    if (s_cycle_bindings_seen & 4) CfgSkip(kvs, N, "GamepadMap", "PrevState");
+    else CfgSet(kvs, N, "GamepadMap", "PrevState", "%s", "L3");
+    if (s_cycle_bindings_seen & 8) CfgSkip(kvs, N, "GamepadMap", "NextState");
+    else CfgSet(kvs, N, "GamepadMap", "NextState", "%s", "R3");
+  } else {
+    CfgSkip(kvs, N, "KeyMap", "PrevState");
+    CfgSkip(kvs, N, "KeyMap", "NextState");
+    CfgSkip(kvs, N, "GamepadMap", "PrevState");
+    CfgSkip(kvs, N, "GamepadMap", "NextState");
+  }
 
   char *data = NULL;
   long sz = 0;
@@ -1078,9 +1130,20 @@ void WriteConfigFile(const char *filename) {
 
     int matched = 0;
     if (*cur) {
+      const char *first = line;
+      while (*first == ' ' || *first == '\t') first++;
+      const int commented = *first == '#';
       for (int i = 0; i < N; i++)
-        if (!kvs[i].done && StringEqualsNoCase(cur, kvs[i].section) && CfgLineIsKey(line, kvs[i].key)) {
-          CfgBuf_EmitKV(&out, &kvs[i]);
+        if (!kvs[i].done && StringEqualsNoCase(cur, kvs[i].section) &&
+            !(kvs[i].insert_only && commented) &&
+            CfgLineIsKey(line, kvs[i].key)) {
+          if (kvs[i].insert_only) {
+            /* Present: keep the player's line byte-for-byte. */
+            CfgBuf_Str(&out, line);
+            CfgBuf_Str(&out, "\n");
+          } else {
+            CfgBuf_EmitKV(&out, &kvs[i]);
+          }
           kvs[i].done = 1;
           matched = 1;
           break;

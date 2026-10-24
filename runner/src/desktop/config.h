@@ -234,6 +234,12 @@ void ConfigReloadGamepadMap(const char *filename);
  * generated default and mapped it to the current one; WriteConfigFile then
  * rewrites that line. The host writes the file once when this is set. */
 bool ConfigKeyMapMigrated(void);
+/* True when the config files did not name the quick-state PrevState/NextState
+ * bindings (either section), so WriteConfigFile should append the
+ * machine-readable defaults for the missing ones. Existing explicit values
+ * are left byte-for-byte as written; a key that is present is never rewritten.
+ * Once the appended keys exist, later launches parse them and this is false. */
+bool ConfigQuickStateBindingsMissing(void);
 /* True when the file carried the former generated GamepadDeadzone (10000 raw
  * units, 30%) and it was read as the current default instead. The caller
  * rewrites config.ini once so the file says what the game is using. */
