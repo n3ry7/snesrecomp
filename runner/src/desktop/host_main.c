@@ -18,6 +18,8 @@
 #include <stdbool.h>
 #include <assert.h>
 #include <signal.h>
+#include <stdarg.h>
+#include <time.h>
 
 #include "debug_server.h"
 #include "desktop/sdl_compat.h"
@@ -1196,19 +1198,36 @@ static void WritePpm(const char *path, const uint8 *pixel_buffer, int pitch,
  * is black while the submitted frame was bright -- the failure check 1 cannot
  * see. See the readback block below for the per-renderer buffer.
  *
+ * Classification (every black episode):
+ *   FADE             brightness 0, INIDISP bit 7 set, brightness 1-7 (the
+ *                    tail of any fade), or the first 180 guest frames (boot).
+ *                    Logged once at episode end, never an anomaly, no BMP.
+ *   SUBMIT_BLACK     black at brightness > 0 with bit 7 clear. Reported after
+ *                    PRESENT_WATCH_N consecutive such frames. One BMP per
+ *                    episode: saves/diag/SUBMIT_BLACK_<frame>.bmp.
+ *   PRESENTER_BLACK  readback black while the submitted frame and region were
+ *                    bright. One BMP: saves/diag/PRESENTER_BLACK_<frame>.bmp.
+ * The title's full-brightness intro cuts are a WRAM-trampoline (PB=$7E)
+ * cinematic context and stay silent by default; STRICT removes that exemption
+ * and the boot/fade heuristics.
+ *
+ * Every event is written to saves/diag/watch.log (UTC timestamp, one line,
+ * still also stderr), capped at 2 MiB with one rotation to watch.log.1. A
+ * player can send that file after a stutter; the startup line records whether
+ * the watch was enabled, the threshold, the readback interval and renderer.
+ *
  * Env (all SNESRECOMP_*):
  *   PRESENT_WATCH=0             disable both checks (default: on)
  *   PRESENT_WATCH_N=<n>         consecutive anomalous presents before a
- *                               SUBMIT_BLACK log (default 10)
+ *                               SUBMIT_BLACK log (default 6)
  *   PRESENT_WATCH_FORCE=1       make the submitted-frame black test report
  *                               true, for verifying that log/artifact path
  *   PRESENT_WATCH_FORCE=present make the READBACK report black while the
  *                               submitted frame stays bright (PRESENTER_BLACK)
  *   PRESENT_WATCH_FORCE_FRAMES=<n>  with FORCE, stop forcing after n presents,
  *                               so the recovery line can be observed in one run
- *   PRESENT_WATCH_STRICT=1      report every black submitted present with
- *                               INIDISP bit 7 clear, including the title's
- *                               intentional black inter-scene gaps
+ *   PRESENT_WATCH_STRICT=1      literal rules: brightness==0 or bit7 is FADE,
+ *                               no boot grace, no PB=$7E exemption
  *   PRESENT_READBACK_EVERY=<n>  presented frames between readbacks (default
  *                               20; 0 disables the readback check)
  */
@@ -1293,11 +1312,76 @@ static int PresentWatch_BattleBank(uint32 pb) {
 void MkDir(const char *s);   /* defined with the SDL presenter below */
 static const char *PresentWatch_ActiveRenderer(void);   /* defined with the SDL presenter */
 
+/* ── Persistent event log ───────────────────────────────────────────────────
+ *
+ * A player who launches from a desktop shortcut has no stderr, so the one
+ * artifact they can send is a file. Every event goes to saves/diag/watch.log
+ * (and still to stderr), with a UTC timestamp. The file is capped at 2 MiB:
+ * before an append that would cross the cap, watch.log is renamed to
+ * watch.log.1 (one generation) and a fresh file starts. The cap is checked on
+ * write, so a long healthy run costs a few bytes when the startup line is
+ * written and nothing afterwards.
+ */
+#define PRESENT_WATCH_LOG_CAP (2u * 1024u * 1024u)
+
+static void PresentWatch_LogTimestamp(char *out, size_t size) {
+  time_t now = time(NULL);
+  struct tm tm_utc;
+#if defined(_WIN32)
+  if (gmtime_s(&tm_utc, &now) != 0) { snprintf(out, size, "1970-01-01T00:00:00Z"); return; }
+#else
+  if (!gmtime_r(&now, &tm_utc)) { snprintf(out, size, "1970-01-01T00:00:00Z"); return; }
+#endif
+  if (!strftime(out, size, "%Y-%m-%dT%H:%M:%SZ", &tm_utc)) out[0] = '\0';
+}
+
+static void PresentWatch_Log(const char *fmt, ...) {
+  static int dirs_ready;
+  if (!dirs_ready) {
+    MkDir("saves");
+    MkDir("saves/diag");
+    dirs_ready = 1;
+  }
+  char ts[32];
+  PresentWatch_LogTimestamp(ts, sizeof(ts));
+  char line[1024];
+  int n = snprintf(line, sizeof(line), "%s [present_watch] ", ts);
+  if (n < 0) n = 0;
+  if ((size_t)n >= sizeof(line)) n = (int)sizeof(line) - 1;
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(line + n, sizeof(line) - (size_t)n, fmt, ap);
+  va_end(ap);
+  size_t len = strlen(line);
+  if (len + 1 < sizeof(line)) {
+    line[len++] = '\n';
+    line[len] = '\0';
+  }
+
+  FILE *old = fopen("saves/diag/watch.log", "rb");
+  if (old) {
+    long size = -1;
+    if (fseek(old, 0, SEEK_END) == 0) size = ftell(old);
+    fclose(old);
+    if (size >= 0 && (size_t)size + len > PRESENT_WATCH_LOG_CAP) {
+      remove("saves/diag/watch.log.1");
+      rename("saves/diag/watch.log", "saves/diag/watch.log.1");
+    }
+  }
+  FILE *f = fopen("saves/diag/watch.log", "ab");
+  if (f) {
+    fwrite(line, 1, len, f);
+    fclose(f);
+  }
+  fputs(line, stderr);
+  fflush(stderr);
+}
+
 /* Shared state for the submitted-frame check and the throttled readback. All
  * of it is main-thread state; a present is Sample() -> EndDraw() ->
  * ReadbackDue()/OnPresentedPixels() in that order. */
 static int pw_enabled = -1;
-static int pw_threshold = 10;
+static int pw_threshold = 6;
 static int pw_strict;
 static int pw_force_submit;
 static int pw_force_present;
@@ -1306,6 +1390,12 @@ static int pw_readback_every = 20;
 static unsigned pw_presents;
 static unsigned pw_submit_consec, pw_submit_last_log;
 static double pw_submit_since;
+static bool pw_submit_logged;
+static bool pw_ep_active, pw_ep_any_fade, pw_ep_any_submit, pw_ep_boot;
+static unsigned pw_ep_consec;
+static double pw_ep_since;
+static unsigned pw_ep_inidisp, pw_ep_brightness, pw_ep_bgmode;
+static uint32 pw_ep_pb;
 static bool pw_submit_black;        /* last submitted frame's black result */
 static bool pw_submit_visible;      /* INIDISP bit 7 clear for that frame */
 static unsigned pw_submit_inidisp, pw_submit_bgmode;
@@ -1315,12 +1405,21 @@ static bool pw_readback_pending;
 static unsigned pw_presenter_consec, pw_presenter_last_log;
 static double pw_presenter_since;
 static bool pw_readback_warned;
+static int pw_inidisp_override = -1;
+
+/* Test hook (debug server `set_present_watch_inidisp`): override the INIDISP
+ * value the watcher classifies/logs, without touching the PPU. The guest's NMI
+ * rewrites $2100 every frame on this title, so a real register poke does not
+ * survive to the present; this lets a test drive the FADE classification. */
+void PresentWatch_SetInidispOverride(int v) {
+  pw_inidisp_override = v & 0xFF;
+}
 
 static void PresentWatch_Init(void) {
   const char *v = HostGetenv("PRESENT_WATCH");
   pw_enabled = v ? atoi(v) != 0 : 1;
   v = HostGetenv("PRESENT_WATCH_N");
-  pw_threshold = v ? atoi(v) : 10;
+  pw_threshold = v ? atoi(v) : 6;
   if (pw_threshold < 1) pw_threshold = 1;
   v = HostGetenv("PRESENT_WATCH_FORCE");
   if (v && !strcmp(v, "present")) {
@@ -1337,6 +1436,17 @@ static void PresentWatch_Init(void) {
   v = HostGetenv("PRESENT_READBACK_EVERY");
   pw_readback_every = v ? atoi(v) : 20;
   if (pw_readback_every < 0) pw_readback_every = 0;
+
+  int win_w = 0, win_h = 0;
+  if (g_window) SDL_GetWindowSize(g_window, &win_w, &win_h);
+  PresentWatch_Log(
+      "STARTUP enabled=%d threshold=%d readback_every=%d strict=%d force=%s "
+      "renderer=%s active=%s output=%u window=%dx%d "
+      "ini=- brightness=- bgmode=- PB=- battle=- consec=0 dur_ms=0",
+      pw_enabled, pw_threshold, pw_readback_every, pw_strict,
+      pw_force_present ? "present" : pw_force_submit ? "submit" : "none",
+      g_config.renderer, PresentWatch_ActiveRenderer(),
+      (unsigned)g_config.output_method, win_w, win_h);
 }
 
 /* The presenters publish the viewport they drew into (window coordinates) so
@@ -1361,69 +1471,121 @@ static void PresentWatch_Sample(const uint8 *pixels, int pitch, int w, int h) {
       (pw_force_frames <= 0 || pw_presents <= (unsigned)pw_force_frames))
     black = true;
   pw_submit_black = black;
-  const unsigned inidisp = g_ppu ? g_ppu->inidisp : 0;
+  const unsigned inidisp = pw_inidisp_override >= 0
+                               ? (unsigned)pw_inidisp_override
+                               : (g_ppu ? g_ppu->inidisp : 0);
   const unsigned bgmode = g_ppu ? (g_ppu->bgmode & 7) : 0;
+  const unsigned brightness = inidisp & 0x0F;
   pw_submit_inidisp = inidisp;
   pw_submit_bgmode = bgmode;
-  /* "The guest says visible": display enabled, not at zero brightness, and not
-   * inside a WRAM-resident trampoline. INIDISP bit 7 clear alone is too weak
-   * for this title: its intro cuts to a full-screen black gap between scenes
-   * (copyright -> pendulum), with bit 7 clear and CGRAM/VRAM loaded, and runs
-   * those cinematics from bank $7E. Those gaps are healthy and must stay
-   * silent, so they are excluded by default; STRICT restores the literal test.
-   * The reported failure is a battle presented black with INIDISP=$0F while
-   * running in a battle bank, which none of these exclusions touches. */
-  const bool guest_visible = (inidisp & 0x80) == 0;
-  const bool benign_context = !pw_strict &&
-      ((inidisp & 0x0F) < 8 || g_cpu.PB == 0x7E);
-  pw_submit_visible = guest_visible;
-  if (!black || !guest_visible || benign_context) {
-    if (pw_submit_consec >= (unsigned)pw_threshold) {
-      const double duration = MonotonicSeconds() - pw_submit_since;
-      fprintf(stderr,
-              "[present_watch] SUBMIT_RECOVERED sim_frame=%u guest_frame=%d present=%u consec=%u "
-              "duration_ms=%.0f inidisp=0x%02X bgmode=%u renderer=%s active=%s\n",
-              g_present_frame, snes_frame_counter, pw_presents, pw_submit_consec,
-              duration * 1000.0, inidisp, bgmode,
-              g_config.renderer, PresentWatch_ActiveRenderer());
-      host_report_breadcrumb("present_watch: submit recovered after %u black presents (%.0f ms)",
-                             pw_submit_consec, duration * 1000.0);
-    }
-    pw_submit_consec = 0;
-  } else {
-    if (pw_submit_consec == 0) {
-      pw_submit_since = MonotonicSeconds();
-      pw_submit_last_log = pw_presents;
-    }
-    ++pw_submit_consec;
-    if (pw_submit_consec == (unsigned)pw_threshold ||
-        (pw_submit_consec > (unsigned)pw_threshold &&
-         pw_presents - pw_submit_last_log >= 60)) {
-      int win_w = 0, win_h = 0;
-      if (g_window) SDL_GetWindowSize(g_window, &win_w, &win_h);
-      const char *bmp = "-";
-      char path[160];
-      if (pw_submit_consec == (unsigned)pw_threshold) {
-        /* One artifact per episode, at the first report. */
-        MkDir("saves");
-        MkDir("saves/diag");
-        snprintf(path, sizeof(path), "saves/diag/black_%u.bmp", g_present_frame);
-        bmp = PresentWatch_WriteBmp(path, pixels, pitch, w, h, false, true)
-                  ? path : "(write failed)";
-        host_report_breadcrumb("present_watch: submit black at frame %u, bmp %s",
-                               g_present_frame, bmp);
+  /* "The guest says visible": display enabled. A black frame at brightness 0
+   * (or with bit 7 set) is a fade/blank the title asked for; brightness 1-7
+   * is treated as a fade too -- the 4-bit brightness has no usable picture
+   * there, every fade passes through it, and logging those as anomalies was
+   * exactly the player's "black stutter" false alarm. The first 180 guest
+   * frames are boot/initialization (a black lead-in with brightness ~10 on
+   * this title), so they are classified as legitimate too. STRICT keeps the
+   * literal brightness==0 rule and disables both the boot grace and the
+   * PB=$7E intro-trampoline exemption. */
+  const bool boot_context = !pw_strict && snes_frame_counter < 180;
+  const bool fade = boot_context || (inidisp & 0x80) != 0 || brightness == 0 ||
+                    (!pw_strict && brightness < 8);
+  const bool benign_context = !pw_strict && !fade && g_cpu.PB == 0x7E;
+  const bool submit_anomaly = black && !fade && !benign_context;
+  pw_submit_visible = (inidisp & 0x80) == 0;
+
+  const double now = MonotonicSeconds();
+  if (!black) {
+    if (pw_ep_active) {
+      const double duration = now - pw_ep_since;
+      if (pw_submit_logged) {
+        PresentWatch_Log(
+            "SUBMIT_RECOVERED ini=0x%02X brightness=%u bgmode=%u PB=0x%02X battle=%d "
+            "renderer=%s active=%s consec=%u dur_ms=%.0f sim_frame=%u guest_frame=%d present=%u",
+            inidisp, brightness, bgmode, (unsigned)g_cpu.PB,
+            PresentWatch_BattleBank((uint32)g_cpu.PB), g_config.renderer,
+            PresentWatch_ActiveRenderer(), pw_ep_consec, duration * 1000.0,
+            g_present_frame, snes_frame_counter, pw_presents);
+        host_report_breadcrumb("present_watch: submit recovered after %u black presents (%.0f ms)",
+                               pw_ep_consec, duration * 1000.0);
+      } else if (pw_ep_any_fade && !pw_ep_any_submit) {
+        PresentWatch_Log(
+            "FADE reason=%s ini=0x%02X brightness=%u bgmode=%u PB=0x%02X battle=%d "
+            "renderer=%s active=%s consec=%u dur_ms=%.0f sim_frame=%u guest_frame=%d present=%u",
+            pw_ep_boot ? "boot" : "fade",
+            pw_ep_inidisp, pw_ep_brightness, pw_ep_bgmode, (unsigned)pw_ep_pb,
+            PresentWatch_BattleBank(pw_ep_pb), g_config.renderer,
+            PresentWatch_ActiveRenderer(), pw_ep_consec, duration * 1000.0,
+            g_present_frame, snes_frame_counter, pw_presents);
       }
-      fprintf(stderr,
-              "[present_watch] SUBMIT_BLACK sim_frame=%u guest_frame=%d present=%u consec=%u "
-              "inidisp=0x%02X bgmode=%u renderer=%s active=%s output=%u new_renderer=%d "
-              "pb=0x%02X battle_bank=%d window=%dx%d size=%dx%d bmp=%s\n",
-              g_present_frame, snes_frame_counter, pw_presents, pw_submit_consec,
-              inidisp, bgmode, g_config.renderer, PresentWatch_ActiveRenderer(),
-              (unsigned)g_config.output_method,
-              g_new_ppu ? 1 : 0, (unsigned)g_cpu.PB,
-              PresentWatch_BattleBank((uint32)g_cpu.PB), win_w, win_h, w, h, bmp);
-      fflush(stderr);
-      pw_submit_last_log = pw_presents;
+    }
+    pw_ep_active = false;
+    pw_ep_consec = 0;
+    pw_ep_any_fade = false;
+    pw_ep_any_submit = false;
+    pw_ep_boot = false;
+    pw_submit_consec = 0;
+    pw_submit_logged = false;
+  } else {
+    if (!pw_ep_active) {
+      pw_ep_active = true;
+      pw_ep_since = now;
+      pw_ep_consec = 0;
+      pw_ep_any_fade = false;
+      pw_ep_any_submit = false;
+      pw_ep_boot = boot_context;
+      pw_submit_consec = 0;
+      pw_submit_logged = false;
+    }
+    ++pw_ep_consec;
+    if (boot_context) pw_ep_boot = true;
+    pw_ep_inidisp = inidisp;
+    pw_ep_brightness = brightness;
+    pw_ep_bgmode = bgmode;
+    pw_ep_pb = (uint32)g_cpu.PB;
+    if (fade) {
+      pw_ep_any_fade = true;
+      pw_submit_consec = 0;   /* a fade breaks the consecutive anomaly run */
+    } else if (benign_context) {
+      pw_submit_consec = 0;
+    } else if (submit_anomaly) {
+      pw_ep_any_submit = true;
+      if (pw_submit_consec == 0) {
+        pw_submit_since = now;
+        pw_submit_last_log = pw_presents;
+      }
+      ++pw_submit_consec;
+      if (pw_submit_consec == (unsigned)pw_threshold ||
+          (pw_submit_consec > (unsigned)pw_threshold &&
+           pw_presents - pw_submit_last_log >= 60)) {
+        int win_w = 0, win_h = 0;
+        if (g_window) SDL_GetWindowSize(g_window, &win_w, &win_h);
+        const char *bmp = "-";
+        char path[160];
+        if (!pw_submit_logged) {
+          /* One artifact per episode, at the first report. */
+          MkDir("saves");
+          MkDir("saves/diag");
+          snprintf(path, sizeof(path), "saves/diag/SUBMIT_BLACK_%u.bmp",
+                   g_present_frame);
+          bmp = PresentWatch_WriteBmp(path, pixels, pitch, w, h, false, true)
+                    ? path : "(write failed)";
+          pw_submit_logged = true;
+          host_report_breadcrumb("present_watch: SUBMIT_BLACK at frame %u, bmp %s",
+                                 g_present_frame, bmp);
+        }
+        PresentWatch_Log(
+            "SUBMIT_BLACK ini=0x%02X brightness=%u bgmode=%u PB=0x%02X battle=%d "
+            "renderer=%s active=%s consec=%u dur_ms=%.0f sim_frame=%u guest_frame=%d "
+            "present=%u output=%u new_renderer=%d window=%dx%d size=%dx%d bmp=%s",
+            inidisp, brightness, bgmode, (unsigned)g_cpu.PB,
+            PresentWatch_BattleBank((uint32)g_cpu.PB), g_config.renderer,
+            PresentWatch_ActiveRenderer(), pw_submit_consec,
+            (now - pw_submit_since) * 1000.0, g_present_frame,
+            snes_frame_counter, pw_presents, (unsigned)g_config.output_method,
+            g_new_ppu ? 1 : 0, win_w, win_h, w, h, bmp);
+        pw_submit_last_log = pw_presents;
+      }
     }
   }
 
@@ -1505,9 +1667,12 @@ int PresentWatch_ReadbackDue(void) {
 void PresentWatch_ReadbackFailed(const char *path) {
   if (pw_readback_warned) return;
   pw_readback_warned = true;
-  fprintf(stderr, "[present_watch] readback unavailable on the %s path (%s); "
-                  "PRESENTER_BLACK cannot be evaluated while readback fails\n",
-          path, SDL_GetError());
+  PresentWatch_Log(
+      "READBACK_UNAVAILABLE ini=0x%02X brightness=%u bgmode=%u PB=0x%02X battle=%d "
+      "renderer=%s active=%s consec=0 dur_ms=0 path=%s error=%s",
+      pw_submit_inidisp, pw_submit_inidisp & 0x0F, pw_submit_bgmode,
+      (unsigned)g_cpu.PB, PresentWatch_BattleBank((uint32)g_cpu.PB),
+      g_config.renderer, PresentWatch_ActiveRenderer(), path, SDL_GetError());
   host_report_breadcrumb("present_watch: %s readback unavailable: %s",
                          path, SDL_GetError());
 }
@@ -1531,11 +1696,15 @@ void PresentWatch_OnPresentedPixels(const uint8 *pixels, int pitch, int w, int h
   if (!black) {
     if (pw_presenter_consec > 0) {
       const double duration = MonotonicSeconds() - pw_presenter_since;
-      fprintf(stderr,
-              "[present_watch] PRESENTER_RECOVERED sim_frame=%u guest_frame=%d present=%u "
-              "consec=%u duration_ms=%.0f path=%s readback=%dx%d readback_ms=%.3f\n",
-              g_present_frame, snes_frame_counter, pw_presents, pw_presenter_consec,
-              duration * 1000.0, path, w, h, readback_ms);
+      PresentWatch_Log(
+          "PRESENTER_RECOVERED ini=0x%02X brightness=%u bgmode=%u PB=0x%02X battle=%d "
+          "renderer=%s active=%s consec=%u dur_ms=%.0f sim_frame=%u guest_frame=%d "
+          "present=%u path=%s readback=%dx%d readback_ms=%.3f",
+          pw_submit_inidisp, pw_submit_inidisp & 0x0F, pw_submit_bgmode,
+          (unsigned)g_cpu.PB, PresentWatch_BattleBank((uint32)g_cpu.PB),
+          g_config.renderer, PresentWatch_ActiveRenderer(), pw_presenter_consec,
+          duration * 1000.0, g_present_frame, snes_frame_counter, pw_presents,
+          path, w, h, readback_ms);
       host_report_breadcrumb("present_watch: presenter recovered after %u readbacks (%.0f ms)",
                              pw_presenter_consec, duration * 1000.0);
       pw_presenter_consec = 0;
@@ -1559,22 +1728,23 @@ void PresentWatch_OnPresentedPixels(const uint8 *pixels, int pitch, int w, int h
   if (pw_presenter_consec == 1) {
     MkDir("saves");
     MkDir("saves/diag");
-    snprintf(file, sizeof(file), "saves/diag/present_black_%u.bmp", g_present_frame);
+    snprintf(file, sizeof(file), "saves/diag/PRESENTER_BLACK_%u.bmp",
+             g_present_frame);
     bmp = PresentWatch_WriteBmp(file, pixels, pitch, w, h, bottom_up != 0, bgra != 0)
               ? file : "(write failed)";
-    host_report_breadcrumb("present_watch: presenter black at frame %u, bmp %s",
+    host_report_breadcrumb("present_watch: PRESENTER_BLACK at frame %u, bmp %s",
                            g_present_frame, bmp);
   }
-  fprintf(stderr,
-          "[present_watch] PRESENTER_BLACK sim_frame=%u guest_frame=%d present=%u consec=%u "
-          "inidisp=0x%02X bgmode=%u pb=0x%02X battle_bank=%d renderer=%s active=%s "
-          "path=%s window=%dx%d readback=%dx%d readback_ms=%.3f bmp=%s\n",
-          g_present_frame, snes_frame_counter, pw_presents, pw_presenter_consec,
-          pw_submit_inidisp, pw_submit_bgmode, (unsigned)g_cpu.PB,
-          PresentWatch_BattleBank((uint32)g_cpu.PB), g_config.renderer,
-          PresentWatch_ActiveRenderer(), path, win_w, win_h, w, h,
-          readback_ms, bmp);
-  fflush(stderr);
+  PresentWatch_Log(
+      "PRESENTER_BLACK ini=0x%02X brightness=%u bgmode=%u PB=0x%02X battle=%d "
+      "renderer=%s active=%s consec=%u dur_ms=%.0f sim_frame=%u guest_frame=%d "
+      "present=%u path=%s window=%dx%d readback=%dx%d readback_ms=%.3f bmp=%s",
+      pw_submit_inidisp, pw_submit_inidisp & 0x0F, pw_submit_bgmode,
+      (unsigned)g_cpu.PB, PresentWatch_BattleBank((uint32)g_cpu.PB),
+      g_config.renderer, PresentWatch_ActiveRenderer(), pw_presenter_consec,
+      (MonotonicSeconds() - pw_presenter_since) * 1000.0, g_present_frame,
+      snes_frame_counter, pw_presents, path, win_w, win_h, w, h,
+      readback_ms, bmp);
   pw_presenter_last_log = pw_presents;
 }
 
@@ -4711,12 +4881,16 @@ static void HandleCommand(uint32 j, bool pressed) {
     case kKeys_ToggleRenderer:
       g_ppu_render_flags ^= kPpuRenderFlags_NewRenderer;
       printf("New renderer = %x\n", g_ppu_render_flags & kPpuRenderFlags_NewRenderer);
-      fprintf(stderr, "[present_watch] ToggleRenderer sim_frame=%u NewRenderer=%d "
-                      "renderer=%s active=%s output=%u\n",
-              g_present_frame,
-              (g_ppu_render_flags & kPpuRenderFlags_NewRenderer) ? 1 : 0,
-              g_config.renderer, PresentWatch_ActiveRenderer(),
-              (unsigned)g_config.output_method);
+      PresentWatch_Log(
+          "ToggleRenderer ini=0x%02X brightness=%u bgmode=%u PB=0x%02X battle=%d "
+          "renderer=%s active=%s consec=0 dur_ms=0 sim_frame=%u present=%u "
+          "NewRenderer=%d output=%u",
+          g_ppu ? g_ppu->inidisp : 0, g_ppu ? (g_ppu->inidisp & 0x0F) : 0,
+          g_ppu ? (g_ppu->bgmode & 7) : 0, (unsigned)g_cpu.PB,
+          PresentWatch_BattleBank((uint32)g_cpu.PB), g_config.renderer,
+          PresentWatch_ActiveRenderer(), g_present_frame, pw_presents,
+          (g_ppu_render_flags & kPpuRenderFlags_NewRenderer) ? 1 : 0,
+          (unsigned)g_config.output_method);
       g_new_ppu = g_ws_active ||
                   (g_ppu_render_flags & kPpuRenderFlags_NewRenderer) != 0;
       break;

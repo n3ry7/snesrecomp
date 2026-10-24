@@ -6129,6 +6129,39 @@ static void cmd_get_ppu_state(const char *args) {
              p->evenFrame ? "true" : "false");
 }
 
+/* Test hook for the present watcher's FADE classification: override the
+ * INIDISP value the watcher sees. The guest NMI rewrites $2100 every frame on
+ * this title, so a real register poke does not survive to the present; this
+ * drives the classifier without changing rendering. -1 clears it. */
+extern void PresentWatch_SetInidispOverride(int v);
+
+static void cmd_set_present_watch_inidisp(const char *args) {
+    unsigned int v = 0;
+    if (sscanf(args, "%x", &v) != 1) {
+        send_fmt("{\"error\":\"usage: set_present_watch_inidisp <hex>\"}");
+        return;
+    }
+    PresentWatch_SetInidispOverride((int)v);
+    send_fmt("{\"ok\":true,\"watch_inidisp\":\"0x%02x\"}", v & 0xFF);
+}
+
+/* Test hook for the present watcher's FADE classification: write INIDISP
+ * directly. The PPU is not mirrored in WRAM, so write_ram cannot reach
+ * $2100; this is the debugger-side equivalent. A game NMI that writes
+ * $2100 will overwrite it, so callers should stop/step the guest. */
+static void cmd_set_ppu_inidisp(const char *args) {
+    unsigned int v = 0;
+    if (sscanf(args, "%x", &v) != 1) {
+        send_fmt("{\"error\":\"usage: set_ppu_inidisp <hex>\"}");
+        return;
+    }
+    if (!g_ppu) { send_fmt("{\"error\":\"ppu not available\"}"); return; }
+    lock_mutex();
+    g_ppu->inidisp = (uint8_t)v;
+    unlock_mutex();
+    send_fmt("{\"ok\":true,\"inidisp\":\"0x%02x\"}", (unsigned)(uint8_t)v);
+}
+
 // Interrupt / timing state. Exposes the SNES-level fields that are
 // load-bearing for NMI/IRQ timing analysis (inNmi, inVblank, scanline,
 // IRQ enables, auto-joypad timer). These were invisible to the debugger
@@ -9506,6 +9539,8 @@ static const CmdEntry s_commands[] = {
     {"dump_cgram",    cmd_dump_cgram},
     {"dump_oam",      cmd_dump_oam},
     {"get_ppu_state", cmd_get_ppu_state},
+    {"set_ppu_inidisp", cmd_set_ppu_inidisp},
+    {"set_present_watch_inidisp", cmd_set_present_watch_inidisp},
     {"raster_journal", cmd_raster_journal},
     {"ppu_lines",     cmd_ppu_lines},
     {"ppu_window",    cmd_ppu_window},
