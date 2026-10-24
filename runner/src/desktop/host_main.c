@@ -3600,6 +3600,11 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
   }
   if (game->state_menu_hotkeys) ConfigUseStateMenuDefaults();
   if (game->in_game_launcher) ConfigUseInGameLauncherDefaults();
+  /* Chrono Trigger ships 16:9 by default: a widescreen field and desktop
+   * fullscreen.  An explicit Fullscreen/Widescreen key in config.ini still
+   * wins (the parser runs after these defaults). */
+  g_config.widescreen = true;
+  g_config.fullscreen = 1;
   ParseConfigFile(config_file);
   g_active_config_file = config_file;
   /* Local overrides (gitignored). Last parser to set a key wins. */
@@ -5396,7 +5401,7 @@ static const char kDefaultConfigIniContent[] =
   "WindowSize = Auto\n"
   "\n"
   "# Fullscreen mode (0=windowed, 1=desktop fullscreen, 2=fullscreen w/mode change)\n"
-  "Fullscreen = 0\n"
+  "Fullscreen = 1\n"
   "\n"
   "# Window scale (1=100%, 2=200%, 3=300%, etc.)\n"
   "WindowScale = 3\n"
