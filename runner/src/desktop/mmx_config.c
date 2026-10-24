@@ -72,6 +72,14 @@ static uint16 kDefaultKbdControls[kKeys_Total] = {
   /* Screenshot is opt-in through a port's config.ini so it does not displace
    * existing F-key overlay defaults. */
   N,
+  /* OpenLauncher is opt-in (ConfigUseInGameLauncherDefaults), so it stays
+   * zero here. */
+  N,
+  /* Quick save / quick load. F5/F9 collide with the legacy Load slots above;
+   * KeyMapHash_Add lets these win, which is what "QuickSave = F5" means for
+   * an existing config.ini that still says Load = F1..F10. */
+  _(SDLK_F5),
+  _(SDLK_F9),
 };
 /* Opt in before parsing: existing hosts keep their legacy slot defaults. */
 void ConfigUseStateMenuDefaults(void) {
@@ -106,6 +114,7 @@ static const KeyNameId kKeyNameId[] = {
   S(Fullscreen), S(Reset),
   S(Pause), S(PauseDimmed), S(Turbo), S(WindowBigger), S(WindowSmaller), S(VolumeUp), S(VolumeDown), S(DisplayPerf), S(ToggleRenderer), S(ToggleWidescreen),
   S(SaveStateMenu), S(Rewind), S(Screenshot), S(OpenLauncher),
+  S(QuickSave), S(QuickLoad),
 };
 #undef S
 #undef M
@@ -144,9 +153,15 @@ static bool KeyMapHash_Add(uint16 key, uint16 cmd) {
     KeyMapHashEnt *ent = &keymap_hash[*cur - 1];
     if (ent->key == key) {
       /* Launcher-editable menu actions take precedence over legacy slot
-       * shortcuts, independently of config line/default registration order. */
-      bool new_menu = cmd == kKeys_SaveStateMenu || cmd == kKeys_Rewind;
-      bool old_menu = ent->cmd == kKeys_SaveStateMenu || ent->cmd == kKeys_Rewind;
+       * shortcuts, independently of config line/default registration order.
+       * QuickSave / QuickLoad are here for the same reason: their defaults
+       * are F5 / F9, which are also Load slots 5 and 9 in every config.ini
+       * this host has ever written, so without the precedence an existing
+       * install would drop the quick keys as duplicates and keep the slots. */
+      bool new_menu = cmd == kKeys_SaveStateMenu || cmd == kKeys_Rewind ||
+                      cmd == kKeys_QuickSave || cmd == kKeys_QuickLoad;
+      bool old_menu = ent->cmd == kKeys_SaveStateMenu || ent->cmd == kKeys_Rewind ||
+                      ent->cmd == kKeys_QuickSave || ent->cmd == kKeys_QuickLoad;
       bool new_slot = cmd >= kKeys_Load && cmd <= kKeys_Save_Last;
       bool old_slot = ent->cmd >= kKeys_Load && ent->cmd <= kKeys_Save_Last;
       if (new_menu && old_slot) ent->cmd = cmd;
@@ -239,6 +254,9 @@ static uint16 joymap_first[kGamepadBtn_Count * 2];  // 2 gamepads
 static GamepadMapEnt *joymap_ents;
 static int joymap_size;
 static uint8 has_assigned_joypad_controls;
+/* Set when [GamepadMap] named QuickSave or QuickLoad, so the R2/L2 defaults
+ * are not registered on top of a player's own binding. */
+static bool s_quick_gamepad_seen;
 
 static int CountBits32(uint32 n) {
   int count = 0;
@@ -355,6 +373,14 @@ static void RegisterDefaultKeys(void) {
     for (int i = 0; i < countof(kDefaultGamepadCmds); i++)
       GamepadMap_Add(kDefaultGamepadCmds[i] + kGamepadBtn_Count, 0, kKeys_ControlsP2 + i);
   }
+  /* Quick save / quick load on player 1's analog triggers. Kept out of the
+   * Controls block above: every existing config.ini has Controls, so that
+   * block is skipped and an upgrade would never see R2/L2. Player 1 only,
+   * per the feature's contract. */
+  if (!s_quick_gamepad_seen) {
+    GamepadMap_Add(kGamepadBtn_R2, 0, kKeys_QuickSave);
+    GamepadMap_Add(kGamepadBtn_L2, 0, kKeys_QuickLoad);
+  }
 }
 
 static int GetIniSection(const char *s) {
@@ -459,6 +485,8 @@ static bool HandleIniConfig(int section, const char *key, char *value) {
         if (StringEqualsNoCase(key, kKeyNameId[i].name)) {
           int id = kKeyNameId[i].id;
           has_assigned_joypad_controls |= (id == kKeys_Controls) ? 1 : (id == kKeys_ControlsP2) ? 2 : 0;
+          if (id == kKeys_QuickSave || id == kKeys_QuickLoad)
+            s_quick_gamepad_seen = true;
           ParseGamepadArray(id == kKeys_ControlsP2 ? 1 : 0, value, kKeyNameId[i].id, kKeyNameId[i].size);
           return true;
         }
@@ -774,6 +802,7 @@ void ConfigReloadGamepadMap(const char *filename) {
   joymap_ents = NULL;
   joymap_size = 0;
   has_assigned_joypad_controls = 0;
+  s_quick_gamepad_seen = false;
 
   ReloadSection(filename, "[GamepadMap]", 5, true);
 
@@ -785,6 +814,10 @@ void ConfigReloadGamepadMap(const char *filename) {
   if (!(has_assigned_joypad_controls & 2)) {
     for (int i = 0; i < countof(kDefaultGamepadCmds); i++)
       GamepadMap_Add(kDefaultGamepadCmds[i] + kGamepadBtn_Count, 0, kKeys_ControlsP2 + i);
+  }
+  if (!s_quick_gamepad_seen) {
+    GamepadMap_Add(kGamepadBtn_R2, 0, kKeys_QuickSave);
+    GamepadMap_Add(kGamepadBtn_L2, 0, kKeys_QuickLoad);
   }
 }
 

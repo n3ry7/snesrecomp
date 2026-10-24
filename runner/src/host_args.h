@@ -61,6 +61,13 @@ typedef struct SnesrecompHostArgs {
   /* --resume-state <path>: a save state to load before the first frame and then
    * delete. Written by the in-game launcher when an edit needs a restart. */
   const char *resume_state;
+  /* --load-state <path>: boot, then load this L3SN v2 snapshot and run.
+   * --save-state <path>: boot, run a few frames, write the snapshot, exit 0.
+   * --state-dir <dir>: where quick save's rolling stash lives (default
+   * "saves/states", exe-relative; an explicit flag is absolutized). */
+  const char *load_state;
+  const char *save_state;
+  const char *state_dir;
   int start_paused;           /* --paused */
   int force_launcher;         /* --launcher */
   int no_launcher;            /* --no-launcher */
@@ -74,6 +81,9 @@ typedef struct SnesrecompHostArgs {
   char script_buf[SNESRECOMP_HOST_ARGS_PATH_MAX];
   char framedump_buf[SNESRECOMP_HOST_ARGS_PATH_MAX];
   char resume_buf[SNESRECOMP_HOST_ARGS_PATH_MAX];
+  char load_state_buf[SNESRECOMP_HOST_ARGS_PATH_MAX];
+  char save_state_buf[SNESRECOMP_HOST_ARGS_PATH_MAX];
+  char state_dir_buf[SNESRECOMP_HOST_ARGS_PATH_MAX];
 } SnesrecompHostArgs;
 
 /* Consume the engine-owned arguments from *argc / *argv, in place.

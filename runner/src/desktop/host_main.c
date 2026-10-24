@@ -76,6 +76,7 @@
 #include "snes_overlay_draw.h"
 #include "snes_osd.h"
 #include "snes_runahead.h"
+#include "snes_quickstate.h"
 
 #if SNESRECOMP_ENABLE_MODS
 #include "mod_runtime.h"
@@ -2902,6 +2903,9 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
    * settings sees the same opt-in the writer will honour. */
   if (game->rewind_settings) ConfigEnableRewindKeys();
   if (game->after_config) game->after_config();
+  /* --state-dir overrides where quick save's rolling stash lives. Absent, the
+   * default is exe-relative "saves/states" (the host anchored the cwd). */
+  if (args.state_dir) SnesQuickStateSetDir(args.state_dir);
   ApplyVolume();
   /* SNESRECOMP_KEYMAP_DUMP=1: what the system hotkeys resolved to, for a
    * headless check that a binding really is bound (a config.ini beside the
@@ -2913,10 +2917,11 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
       { "Screenshot", kKeys_Screenshot }, { "DisplayPerf", kKeys_DisplayPerf },
       { "Pause", kKeys_Pause }, { "Reset", kKeys_Reset },
       { "OpenLauncher", kKeys_OpenLauncher },
+      { "QuickSave", kKeys_QuickSave }, { "QuickLoad", kKeys_QuickLoad },
     };
     static const SDL_Keycode kKeys[] = {
       SDLK_KP_PLUS, SDLK_KP_MINUS, SDLK_F11, SDLK_F12, SDLK_f, SDLK_p, SDLK_EQUALS, SDLK_MINUS,
-      SDLK_F7, SDLK_F8, SDLK_r, SDLK_l,
+      SDLK_F7, SDLK_F8, SDLK_r, SDLK_l, SDLK_F5, SDLK_F9,
     };
     for (size_t i = 0; i < sizeof(kProbe) / sizeof(kProbe[0]); i++) {
       const char *bound = "(unbound among the probed keys)";
@@ -2933,6 +2938,16 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
         }
       }
       fprintf(stderr, "[keymap] %s = %s\n", kProbe[i].name, bound);
+    }
+    /* The trigger half: the same FindCmdForGamepadButton() the SDL axis path
+     * calls (HandleGamepadAxisInput -> kGamepadBtn_R2/L2), for player 1. */
+    {
+      int r2 = FindCmdForGamepadButton(kGamepadBtn_R2, 0);
+      int l2 = FindCmdForGamepadButton(kGamepadBtn_L2, 0);
+      fprintf(stderr, "[gamemap] P1 R2 -> %s\n",
+              r2 == kKeys_QuickSave ? "QuickSave" : r2 ? "other" : "(unbound)");
+      fprintf(stderr, "[gamemap] P1 L2 -> %s\n",
+              l2 == kKeys_QuickLoad ? "QuickLoad" : l2 ? "other" : "(unbound)");
     }
   }
   if (ConfigKeyMapMigrated()) {
@@ -3149,7 +3164,7 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
     } else {
       fprintf(stderr, "[main] Debug server failed to bind port %d\n", debug_port);
     }
-    if (start_paused) {
+    if (start_paused && !args.save_state) {
       debug_server_start_paused();
 #if SNESRECOMP_TRACE
       fprintf(stderr, "[main] Started paused — send 'step N' or 'continue' via TCP\n");
@@ -3425,6 +3440,19 @@ error_reading:;
     if (resumed) remove(args.resume_state);
   }
 
+  /* --load-state: boot, then restore this L3SN v2 snapshot before the first
+   * frame. Absolute or exe-relative (host_args absolutized it before the
+   * chdir). A failure is reported and makes the process exit non-zero rather
+   * than silently booting a fresh game. */
+  int cli_exit_code = 0;
+  if (args.load_state) {
+    bool loaded = SnesQuickStateLoadFrom(args.load_state);
+    if (loaded) GameReset();
+    host_report_breadcrumb("--load-state %s: %s", args.load_state,
+                           loaded ? "loaded" : "FAILED");
+    if (!loaded) cli_exit_code = 4;
+  }
+
   if (script_file)
     LoadScript(script_file);
 
@@ -3439,8 +3467,11 @@ error_reading:;
                              g_config.rewind_interval);
 
   RtlEnableExtendedFrameTiming();
-  bool running = true;
-  const char *exit_reason = "loop ended";
+  /* A failed --load-state leaves cli_exit_code at 4: do not run a fresh game
+   * as if nothing happened. Fall through to the normal cleanup and exit
+   * non-zero instead. */
+  bool running = cli_exit_code == 0;
+  const char *exit_reason = cli_exit_code == 4 ? "load-state failed" : "loop ended";
   uint32 frameCtr = 0;
   /* Run-ahead rasterises the speculated frame itself; it needs the number the
    * iteration is about to reach, which is this counter plus one. */
@@ -3562,6 +3593,22 @@ error_reading:;
       int ss = debug_server_consume_savestate();
       if (ss >= 0)
         RtlSaveLoad(kSaveLoad_Save, ss);
+    }
+    /* --save-state: boot, run a few frames so the machine is past its
+     * cold-boot init, write the snapshot, and exit with a status a harness
+     * can trust. Done on the main thread at a frame boundary, the same point
+     * a quicksave hotkey lands on. */
+    if (args.save_state && frameCtr >= 30) {
+      size_t bytes = 0;
+      bool ok = SnesQuickStateSaveTo(args.save_state, &bytes);
+      fprintf(stderr, "[main] --save-state %s: %s\n", args.save_state,
+              ok ? "written" : "FAILED");
+      host_report_breadcrumb("--save-state %s: %s", args.save_state,
+                             ok ? "written" : "FAILED");
+      if (!ok) cli_exit_code = 5;
+      running = false;
+      exit_reason = ok ? "save-state written" : "save-state failed";
+      break;
     }
     double before_debug_wait = MonotonicSeconds();
     debug_server_wait_if_paused();
@@ -3987,7 +4034,7 @@ error_reading:;
     }
     host_report_breadcrumb("in-game launcher: restarted");
   }
-  return g_script_failed ? 3 : 0;
+  return g_script_failed ? 3 : cli_exit_code;
 }
 
 /* ── Input plumbing ───────────────────────────────────────────────────────── */
@@ -4067,6 +4114,28 @@ static void HandleCommand(uint32 j, bool pressed) {
     case kKeys_OpenLauncher:
       if (g_game->in_game_launcher) g_open_launcher_hotkey = 1;
       break;
+    case kKeys_QuickSave: {
+      char path[SNES_QUICKSTATE_PATH_MAX];
+      size_t bytes = 0;
+      if (SnesQuickStateSave(path, sizeof(path), &bytes)) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "Quick saved (%.1f KB)", (double)bytes / 1024.0);
+        snes_osd_push(msg, 1500);
+      } else {
+        snes_osd_push("Quick save failed", 2000);
+      }
+      break;
+    }
+    case kKeys_QuickLoad: {
+      char path[SNES_QUICKSTATE_PATH_MAX];
+      if (SnesQuickStateLoad(path, sizeof(path))) {
+        snes_osd_push("Quick loaded", 1500);
+        GameReset();
+      } else {
+        snes_osd_push("Quick load failed", 2000);
+      }
+      break;
+    }
     case kKeys_ToggleRenderer:
       g_ppu_render_flags ^= kPpuRenderFlags_NewRenderer;
       printf("New renderer = %x\n", g_ppu_render_flags & kPpuRenderFlags_NewRenderer);
@@ -4386,6 +4455,10 @@ static const char kDefaultConfigIniContent[] =
   "ToggleRenderer = r\n"
   "SaveStateMenu = F11\n"
   "Rewind = F12\n"
+  "# Quick save/load: a rolling stash of the last 20 full-machine snapshots\n"
+  "# (saves/states). F5/F9 beat the legacy Load slots they overlap.\n"
+  "QuickSave = F5\n"
+  "QuickLoad = F9\n"
   "Load =      F1,     F2,     F3,     F4,     F5,     F6,     F7,     F8,     F9,     F10\n"
   "Save = Shift+F1,Shift+F2,Shift+F3,Shift+F4,Shift+F5,Shift+F6,Shift+F7,Shift+F8,Shift+F9,Shift+F10\n"
   "\n"
@@ -4400,7 +4473,11 @@ static const char kDefaultConfigIniContent[] =
   "#   Up, Down, Left, Right, Select, Start, A, B, X, Y, L, R\n"
   "# Edit + restart to rebind. Shoulder = L1/Lb (top), trigger = L2.\n"
   "Controls =   DpadUp, DpadDown, DpadLeft, DpadRight, Back, Start, B, A, Y, X, Lb, Rb\n"
-  "ControlsP2 = DpadUp, DpadDown, DpadLeft, DpadRight, Back, Start, B, A, Y, X, Lb, Rb\n";
+  "ControlsP2 = DpadUp, DpadDown, DpadLeft, DpadRight, Back, Start, B, A, Y, X, Lb, Rb\n"
+  "\n"
+  "# Player 1's analog triggers: R2 quick-saves, L2 loads the newest snapshot.\n"
+  "QuickSave = R2\n"
+  "QuickLoad = L2\n";
 
 static const char *DefaultConfigIni(void) {
   if (g_game->default_config_ini) return g_game->default_config_ini;
@@ -4411,6 +4488,7 @@ static const char *DefaultConfigIni(void) {
     snprintf(menu_config, sizeof(menu_config), "%.*s%s%s",
         (int)(keys - kDefaultConfigIniContent), kDefaultConfigIniContent,
         "SaveStateMenu = F7\nRewind = F8\n"
+        "QuickSave = F5\nQuickLoad = F9\n"
         "Load = F1,F2,F3,F4,F5,F6,F11,F12,F9,F10\n", after_load);
     return menu_config;
   }

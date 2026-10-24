@@ -188,6 +188,7 @@ set(SNESRECOMP_RUNNER_SOURCES
     ${SNESRECOMP_RUNNER_ROOT}/src/snes_savestate_menu.c
     ${SNESRECOMP_RUNNER_ROOT}/src/snes_osd.c
     ${SNESRECOMP_RUNNER_ROOT}/src/snes_rewind.c
+    ${SNESRECOMP_RUNNER_ROOT}/src/snes_quickstate.c
     ${SNESRECOMP_RUNNER_ROOT}/src/cpu_state.c
     ${SNESRECOMP_RUNNER_ROOT}/src/program_module.c
     ${SNESRECOMP_RUNNER_ROOT}/src/rom_patch.c

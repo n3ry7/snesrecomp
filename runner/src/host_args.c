@@ -35,6 +35,9 @@ void snesrecomp_host_args_usage(const char *program, const char *extra) {
           "  --framedump <dir>     write frames to this directory.\n"
           "  --resume-state <path> load this save state before the first frame,\n"
           "                        then delete it (the in-game launcher's restart).\n"
+          "  --load-state <path>   boot, then load this snapshot and run.\n"
+          "  --save-state <path>   boot, run a few frames, write this snapshot, exit.\n"
+          "  --state-dir <dir>     quick-save stash directory (default saves/states).\n"
           "  --help, -h            this message.\n");
   if (extra && extra[0]) fprintf(stderr, "%s", extra);
 }
@@ -67,6 +70,9 @@ int snesrecomp_host_args_parse(int *argc_io, char ***argv_io,
   const char *script_raw = NULL;
   const char *framedump_raw = NULL;
   const char *resume_raw = NULL;
+  const char *load_state_raw = NULL;
+  const char *save_state_raw = NULL;
+  const char *state_dir_raw = NULL;
 
   /* Single order-independent pass. argv[0] is kept; everything this function
    * does not claim is compacted back into argv in its original order. */
@@ -99,7 +105,8 @@ int snesrecomp_host_args_parse(int *argc_io, char ***argv_io,
      * used to behave. */
     if (strcmp(a, "--rom") == 0 || strcmp(a, "--config") == 0 ||
         strcmp(a, "--script") == 0 || strcmp(a, "--framedump") == 0 ||
-        strcmp(a, "--resume-state") == 0) {
+        strcmp(a, "--resume-state") == 0 || strcmp(a, "--load-state") == 0 ||
+        strcmp(a, "--save-state") == 0 || strcmp(a, "--state-dir") == 0) {
       if (i + 1 >= argc || !argv[i + 1]) {
         fprintf(stderr, "%s requires a path\n\n", a);
         snesrecomp_host_args_usage(program, NULL);
@@ -110,6 +117,9 @@ int snesrecomp_host_args_parse(int *argc_io, char ***argv_io,
       else if (strcmp(a, "--config") == 0) config_raw = v;
       else if (strcmp(a, "--script") == 0) script_raw = v;
       else if (strcmp(a, "--resume-state") == 0) resume_raw = v;
+      else if (strcmp(a, "--load-state") == 0) load_state_raw = v;
+      else if (strcmp(a, "--save-state") == 0) save_state_raw = v;
+      else if (strcmp(a, "--state-dir") == 0) state_dir_raw = v;
       else framedump_raw = v;
       continue;
     }
@@ -147,6 +157,12 @@ int snesrecomp_host_args_parse(int *argc_io, char ***argv_io,
                                   sizeof(out->framedump_buf));
   out->resume_state = absolutize(resume_raw, out->resume_buf,
                                  sizeof(out->resume_buf));
+  out->load_state = absolutize(load_state_raw, out->load_state_buf,
+                               sizeof(out->load_state_buf));
+  out->save_state = absolutize(save_state_raw, out->save_state_buf,
+                               sizeof(out->save_state_buf));
+  out->state_dir = absolutize(state_dir_raw, out->state_dir_buf,
+                              sizeof(out->state_dir_buf));
   tier2_capture_configure(out->expose_coverage_mod, -1, out->coverage_capture);
   return 1;
 }

@@ -58,6 +58,7 @@ extern int snes_frame_counter;
 #include "snes/cx4.h"
 #include "snes/ws_shadow.h"
 #include "snes/interp_bridge.h"
+#include "snes_quickstate.h"
 #include "cpu_state.h"
 #include "cpu_trace.h"
 #include "common_rtl.h"
@@ -5046,6 +5047,32 @@ static void cmd_load_state(const char *args) {
              fs.total + 8, filename);
 }
 
+// ---- quick save / quick load: the SAME handlers the R2/L2 hotkeys call ----
+// These exercise the rolling stash in snes_quickstate.c. Like save_state /
+// load_state above they walk live machine state, so issue them while the
+// guest is paused (--paused, or after `step N` returns) rather than mid-frame.
+static void cmd_quick_save(const char *args) {
+    (void)args;
+    char path[SNES_QUICKSTATE_PATH_MAX];
+    size_t bytes = 0;
+    if (!SnesQuickStateSave(path, sizeof(path), &bytes)) {
+        send_fmt("{\"error\":\"quick save failed (see stderr)\"}");
+        return;
+    }
+    send_fmt("{\"ok\":true,\"file\":\"%s\",\"bytes\":%zu,\"format\":\"rollback-v2\"}",
+             path, bytes);
+}
+
+static void cmd_quick_load(const char *args) {
+    (void)args;
+    char path[SNES_QUICKSTATE_PATH_MAX];
+    if (!SnesQuickStateLoad(path, sizeof(path))) {
+        send_fmt("{\"error\":\"quick load failed (see stderr)\"}");
+        return;
+    }
+    send_fmt("{\"ok\":true,\"file\":\"%s\",\"format\":\"rollback-v2\"}", path);
+}
+
 // write_cart <rom_offset_hex> <hex_bytes> — live debug patch of the in-memory
 // cartridge image. Used only by the cheat/debug tooling; never writes files.
 static void cmd_write_cart(const char *args) {
@@ -9306,6 +9333,8 @@ static const CmdEntry s_commands[] = {
     {"savestate",     cmd_savestate},
     {"save_state",    cmd_save_state},
     {"load_state",    cmd_load_state},
+    {"quick_save",    cmd_quick_save},
+    {"quick_load",    cmd_quick_load},
     {"invoke_recomp", cmd_invoke_recomp},
     {"call_func",     cmd_call_func},
     {"call_func_lle", cmd_call_func_lle},

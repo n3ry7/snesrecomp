@@ -44,6 +44,12 @@ enum {
   /* Reopen the launcher mid-game (SnesDesktopHostGame.in_game_launcher).
    * Appended for the same reason as SaveStateMenu. */
   kKeys_OpenLauncher,
+  /* Quick save / quick load: a rolling stash of the last 20 full-machine
+   * snapshots (snes_quickstate.c). Appended so the Load/Save slot ranges
+   * above keep their numbering. Bound to F5 / F9 and the R2 / L2 triggers by
+   * default; see KeyMapHash_Add for why they beat the legacy F5/F9 slots. */
+  kKeys_QuickSave,
+  kKeys_QuickLoad,
   kKeys_Total,
 };
 
