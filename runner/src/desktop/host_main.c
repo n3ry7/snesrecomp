@@ -1748,7 +1748,35 @@ void PresentWatch_OnPresentedPixels(const uint8 *pixels, int pitch, int w, int h
   pw_presenter_last_log = pw_presents;
 }
 
+/* Phantom vblank blank guard.
+ *
+ * The NMI force-blanks $2100 on entry (D1:E7D4) and the pre-NMI path does the
+ * same at D1:FEC1; the dispatched routine restores it from $7E:BB00 a few
+ * lines later (CD:0925).  On a small number of frames the host frame boundary
+ * falls between the blank and the restore, so the frame is presented wholly
+ * black even though the guest intended full brightness -- the restore lands
+ * ~17 ms later.  The present watcher recorded these as `FADE ini=0x80
+ * brightness=0 ... dur_ms=17 consec=1`, i.e. the player-visible single-frame
+ * flicker in battle.
+ *
+ * Hold the previous frame for that one refresh instead.  A real blank episode
+ * (fade/warp) has a dark $BB00 or repeats, so it is presented normally no
+ * later than its second frame; nothing is hidden for longer than 17 ms. */
+static int s_prev_present_bright = 1;
+static double s_phantom_hold_since = 0;
+
 static void DrawPpuFrameWithPerf(void) {
+  const unsigned ini_now = g_ppu ? (unsigned)g_ppu->inidisp : 0;
+  const unsigned want_brightness = g_ram ? (unsigned)(g_ram[0xBB00] & 0x0F) : 0;
+  if ((ini_now & 0x80) && want_brightness >= 8 && s_prev_present_bright) {
+    /* Time-bounded so a presentation clock faster than the simulation
+     * (decoupled 120 Hz) cannot re-present the stale blank mid-hold. */
+    const double now = MonotonicSeconds();
+    if (s_phantom_hold_since == 0) s_phantom_hold_since = now;
+    if (now - s_phantom_hold_since < 0.025) return;
+  }
+  s_phantom_hold_since = 0;
+
   double profile_start = ProfileStart();
   PreparePpuFrame();
   const int render_scale = 1;
@@ -1957,6 +1985,8 @@ static void DrawPpuFrameWithPerf(void) {
   profile_start = ProfileStart();
   g_renderer_funcs.EndDraw();
   ProfileEnd(kProfilePresent, profile_start);
+  s_prev_present_bright = (ini_now & 0x80) == 0 && (ini_now & 0x0F) >= 8;
+  s_phantom_hold_since = 0;
 }
 
 /* Seat-0 input word the overlays navigate with — the same sources the guest
