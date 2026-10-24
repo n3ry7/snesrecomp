@@ -10,6 +10,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
 #if SNESRECOMP_SDL3
 #define SDL_ENABLE_OLD_NAMES
@@ -201,6 +202,36 @@ static inline bool snesrecomp_sdl_get_render_output_size(
   return SDL_GetRenderOutputSize(renderer, width, height);
 #else
   return SDL_GetRendererOutputSize(renderer, width, height) == 0;
+#endif
+}
+
+/* Read a rectangle of the current render target into an ARGB8888 buffer.
+ * SDL2 fills the caller's buffer in place; SDL3 returns a new surface (its API
+ * changed with 3.0), so that branch copies into the caller's buffer and frees
+ * the surface. The caller still owns one static destination buffer; the only
+ * allocation is SDL3's per-readback surface, not a per-frame one. */
+static inline int snesrecomp_sdl_render_read_pixels(
+    SDL_Renderer *renderer, const SDL_Rect *rect, void *pixels, int pitch) {
+#if SNESRECOMP_SDL3
+  SDL_Surface *s = SDL_RenderReadPixels(renderer, rect);
+  if (!s) return 0;
+  SDL_Surface *src = s;
+  if (s->format != SDL_PIXELFORMAT_ARGB8888 &&
+      s->format != SDL_PIXELFORMAT_XRGB8888) {
+    src = SDL_ConvertSurface(s, SDL_PIXELFORMAT_ARGB8888);
+    SDL_DestroySurface(s);
+    if (!src) return 0;
+  }
+  int ok = src->w == rect->w && src->h == rect->h;
+  for (int y = 0; ok && y < src->h; y++)
+    memcpy((uint8_t *)pixels + (size_t)y * (size_t)pitch,
+           (const uint8_t *)src->pixels + (size_t)y * (size_t)src->pitch,
+           (size_t)src->w * 4u);
+  SDL_DestroySurface(src);
+  return ok;
+#else
+  return SDL_RenderReadPixels(renderer, rect, SDL_PIXELFORMAT_ARGB8888,
+                              pixels, pitch) == 0;
 #endif
 }
 

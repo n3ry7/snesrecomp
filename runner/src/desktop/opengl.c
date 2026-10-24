@@ -46,6 +46,7 @@ static SDL_Window *g_window;
 static uint8 *g_screen_buffer;
 static size_t g_screen_buffer_size;
 static int g_draw_width, g_draw_height;
+static SnesDisplayViewport g_viewport;
 static unsigned int g_program, g_flash_program, g_VAO;
 static GlTextureWithSize g_texture;
 static GlslShader *g_glsl_shader;
@@ -54,6 +55,15 @@ static double g_screenshot_flash_start_time = -1.0;
 static const double kScreenshotFlashSeconds = 0.15;
 
 extern void MkDir(const char *s);
+
+/* desktop/host_main.c: throttled presented-buffer watcher. Declared here rather
+ * than in a shared header because the GL presenter is its only external user. */
+extern int PresentWatch_ReadbackDue(void);
+extern void PresentWatch_OnPresentedPixels(const uint8 *pixels, int pitch, int w,
+                                           int h, int bottom_up, int bgra,
+                                           const char *path, double readback_ms);
+extern void PresentWatch_ReadbackFailed(const char *path);
+extern void PresentWatch_NotePresenterRect(int x, int y, int w, int h);
 
 /* -1 = decide from config at init. A host that paces presentation itself
  * (an FPS cap, a simulation/presentation split) sets 0 so the swap does not
@@ -373,22 +383,27 @@ static void OpenGLRenderer_BeginDraw(int width, int height, uint8 **pixels, int 
   g_draw_height = height;
   *pixels = g_screen_buffer;
   *pitch = width * 4;
+
+  /* Compute the destination rectangle once here: EndDraw draws into it and the
+   * host's present watcher needs the same rectangle to compare the window
+   * readback with the matching region of the submitted frame. The hook is
+   * called once per frame, exactly as it was before this change. */
+  int drawable_width, drawable_height;
+  snesrecomp_sdl_get_drawable_size(g_window, &drawable_width, &drawable_height);
+  SnesDisplayAspect_ComputeViewport(
+      width, height, drawable_width, drawable_height,
+      SnesDisplayAspect_Clamp(g_config.display_aspect),
+      g_config.ignore_aspect_ratio, false, &g_viewport);
+  if (g_compute_viewport)
+    g_compute_viewport(width, height, drawable_width, drawable_height, &g_viewport);
+  PresentWatch_NotePresenterRect(g_viewport.x, g_viewport.y,
+                                 g_viewport.width, g_viewport.height);
 }
 
 static void OpenGLRenderer_EndDraw(void) {
+  SnesDisplayViewport viewport = g_viewport;
   int drawable_width, drawable_height;
-
   snesrecomp_sdl_get_drawable_size(g_window, &drawable_width, &drawable_height);
-
-  /* The framework's own aspect maths, rather than a per-game copy: it knows
-   * all three pixel aspects the config offers, and centres on both axes. */
-  SnesDisplayViewport viewport;
-  SnesDisplayAspect_ComputeViewport(
-      g_draw_width, g_draw_height, drawable_width, drawable_height,
-      SnesDisplayAspect_Clamp(g_config.display_aspect),
-      g_config.ignore_aspect_ratio, false, &viewport);
-  if (g_compute_viewport)
-    g_compute_viewport(g_draw_width, g_draw_height, drawable_width, drawable_height, &viewport);
 
   glBindTexture(GL_TEXTURE_2D, g_texture.gl_texture);
   if (g_draw_width == g_texture.width && g_draw_height == g_texture.height) {
@@ -413,6 +428,26 @@ static void OpenGLRenderer_EndDraw(void) {
   } else {
     GlslShader_Render(g_glsl_shader, &g_texture, viewport.x, viewport.y,
                       viewport.width, viewport.height);
+  }
+
+  /* Throttled presented-buffer readback. GL_BACK of the default framebuffer is
+   * exactly what SDL_GL_SwapWindow is about to publish; reading before the
+   * swap is the only point where that content is defined. A centred
+   * min(256,viewport) x min(224,viewport) rectangle avoids letterbox bars. */
+  if (PresentWatch_ReadbackDue() && viewport.width > 0 && viewport.height > 0) {
+    int rw = viewport.width < 256 ? viewport.width : 256;
+    int rh = viewport.height < 224 ? viewport.height : 224;
+    int rx = viewport.x + (viewport.width - rw) / 2;
+    int ry = viewport.y + (viewport.height - rh) / 2;
+    static uint8 readback[256 * 224 * 4];
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    glReadBuffer(GL_BACK);
+    Uint64 t0 = SDL_GetPerformanceCounter();
+    glReadPixels(rx, ry, rw, rh, GL_RGBA, GL_UNSIGNED_BYTE, readback);
+    double ms = 1000.0 * (double)(SDL_GetPerformanceCounter() - t0) /
+                (double)SDL_GetPerformanceFrequency();
+    PresentWatch_OnPresentedPixels(readback, rw * 4, rw, rh,
+                                   /*bottom_up=*/1, /*bgra=*/0, "GL", ms);
   }
 
   if (g_want_screenshot) {

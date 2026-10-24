@@ -1160,6 +1160,418 @@ static void WritePpm(const char *path, const uint8 *pixel_buffer, int pitch,
     host_report_breadcrumb("screenshot: wrote %s (%dx%d) at frame %u", path, w, h, frame);
 }
 
+/* ── Present watcher: "the guest says visible, the presented picture is black" ─
+ *
+ * A transient black screen during a battle was reported while the guest kept
+ * running: INIDISP=0x0F and intact VRAM in the savestate, a correct picture on
+ * reload. The guest was drawing; the frame handed to the presenter was not.
+ * Nothing in the tree sampled either the submitted picture or the presented
+ * one, so there was no record of the frame that went wrong. This is that
+ * record, and nothing else: it reads guest state, never writes it, and is
+ * silent on healthy frames.
+ *
+ * Check 1 (SUBMIT_BLACK). DrawPpuFrameWithPerf fills `pixel_buffer` and hands
+ * exactly that buffer to EndDraw, which uploads it (OpenGL: glTexSubImage2D
+ * from a plain malloc'd g_screen_buffer; SDL: the locked streaming texture)
+ * and presents. Sampling there is the cheapest correct point: on the GL path
+ * it is ordinary host RAM, and on every path it is the very memory the upload
+ * reads, so the test sees what the presenter was asked to show. Its blind spot
+ * is anything after the upload, which is why check 2 exists.
+ *
+ * Cost. A 64x56 lattice (3,584 points) is sampled only while every point so
+ * far is below the threshold; the first pixel with any channel >= 8 ends the
+ * scan. Healthy frames therefore cost O(1) reads, a fully black frame the
+ * whole lattice, and nothing allocates. The SDL path samples a locked
+ * streaming texture, whose reads can be uncached; even then the lattice is a
+ * few thousand reads, spread over cache lines, not a full-frame scan.
+ *
+ * Check 2 (PRESENTER_BLACK). A second, throttled check reads a small rectangle
+ * back from the render target at present time and reports it when the window
+ * is black while the submitted frame was bright -- the failure check 1 cannot
+ * see. See the readback block below for the per-renderer buffer.
+ *
+ * Env (all SNESRECOMP_*):
+ *   PRESENT_WATCH=0             disable both checks (default: on)
+ *   PRESENT_WATCH_N=<n>         consecutive anomalous presents before a
+ *                               SUBMIT_BLACK log (default 10)
+ *   PRESENT_WATCH_FORCE=1       make the submitted-frame black test report
+ *                               true, for verifying that log/artifact path
+ *   PRESENT_WATCH_FORCE=present make the READBACK report black while the
+ *                               submitted frame stays bright (PRESENTER_BLACK)
+ *   PRESENT_WATCH_FORCE_FRAMES=<n>  with FORCE, stop forcing after n presents,
+ *                               so the recovery line can be observed in one run
+ *   PRESENT_WATCH_STRICT=1      report every black submitted present with
+ *                               INIDISP bit 7 clear, including the title's
+ *                               intentional black inter-scene gaps
+ *   PRESENT_READBACK_EVERY=<n>  presented frames between readbacks (default
+ *                               20; 0 disables the readback check)
+ */
+static bool PresentWatch_RectIsBlack(const uint8 *pixels, int pitch,
+                                     int x0, int y0, int w, int h) {
+  if (!pixels || pitch <= 0 || w <= 0 || h <= 0) return false;
+  enum { kCols = 64, kRows = 56, kBlackLevel = 8 };
+  for (int sy = 0; sy < kRows; sy++) {
+    int y = y0 + (int)((long long)sy * (h - 1) / (kRows - 1));
+    const uint32_t *row = (const uint32_t *)(pixels + (size_t)y * (size_t)pitch);
+    for (int sx = 0; sx < kCols; sx++) {
+      int x = x0 + (int)((long long)sx * (w - 1) / (kCols - 1));
+      uint32_t p = row[x];
+      unsigned r = (p >> 16) & 0xFF, g = (p >> 8) & 0xFF, b = p & 0xFF;
+      unsigned max = r > g ? r : g;
+      if (b > max) max = b;
+      if (max >= kBlackLevel) return false;   /* healthy: stop immediately */
+    }
+  }
+  return true;
+}
+
+static bool PresentWatch_FrameIsBlack(const uint8 *pixels, int pitch, int w, int h) {
+  return PresentWatch_RectIsBlack(pixels, pitch, 0, 0, w, h);
+}
+
+/* The existing BMP writer (opengl.c) is a full-window GL readback and is
+ * static to that translation unit. The frame we have is already the pixels the
+ * presenter was given, so write the minimal 32-bit BMP here: 54-byte
+ * BITMAPINFOHEADER, BI_RGB, bottom-up, rows are 4-byte aligned by definition. */
+static void PutLe16(uint8 *p, uint32 v) { p[0] = (uint8)v; p[1] = (uint8)(v >> 8); }
+static void PutLe32(uint8 *p, uint32 v) {
+  p[0] = (uint8)v; p[1] = (uint8)(v >> 8); p[2] = (uint8)(v >> 16);
+  p[3] = (uint8)(v >> 24);
+}
+static bool PresentWatch_WriteBmp(const char *path, const uint8 *pixels,
+                                  int pitch, int w, int h, bool bottom_up,
+                                  bool bgra) {
+  FILE *f = fopen(path, "wb");
+  if (!f) return false;
+  const uint32 image_bytes = (uint32)w * (uint32)h * 4u;
+  uint8 hdr[54];
+  memset(hdr, 0, sizeof(hdr));
+  hdr[0] = 'B'; hdr[1] = 'M';
+  PutLe32(hdr + 2, 54u + image_bytes);
+  PutLe32(hdr + 10, 54u);
+  PutLe32(hdr + 14, 40u);
+  PutLe32(hdr + 18, (uint32)w);
+  PutLe32(hdr + 22, (uint32)h);
+  PutLe16(hdr + 26, 1u);
+  PutLe16(hdr + 28, 32u);
+  PutLe32(hdr + 34, image_bytes);
+  bool ok = fwrite(hdr, 1, sizeof(hdr), f) == sizeof(hdr);
+  /* BMP stores bottom-up: an SDL/host buffer has row 0 at the top, a GL
+   * glReadPixels buffer has row 0 at the bottom. The GL RGBA bytes are also
+   * R,G,B,A, while BI_RGB 32bpp wants B,G,R,unused, so swap in that path. */
+  for (int i = 0; ok && i < h; i++) {
+    int y = bottom_up ? i : h - 1 - i;
+    const uint8 *row = pixels + (size_t)y * (size_t)pitch;
+    if (bgra) {
+      ok = fwrite(row, 1, (size_t)w * 4, f) == (size_t)w * 4;
+    } else {
+      for (int x = 0; ok && x < w; x++) {
+        ok = fputc(row[x * 4 + 2], f) != EOF &&
+             fputc(row[x * 4 + 1], f) != EOF &&
+             fputc(row[x * 4 + 0], f) != EOF &&
+             fputc(0, f) != EOF;
+      }
+    }
+  }
+  fclose(f);
+  return ok;
+}
+
+/* The battle-bank set the port uses (src/game_rtl.c ct_battle_bank): C1/CC/CD/CF
+ * are battle code, while the field main loop parks in C0. Kept here as a label
+ * for the log only -- the condition is PB itself, printed alongside it. */
+static int PresentWatch_BattleBank(uint32 pb) {
+  return pb == 0xC1u || pb == 0xCCu || pb == 0xCDu || pb == 0xCFu;
+}
+
+void MkDir(const char *s);   /* defined with the SDL presenter below */
+static const char *PresentWatch_ActiveRenderer(void);   /* defined with the SDL presenter */
+
+/* Shared state for the submitted-frame check and the throttled readback. All
+ * of it is main-thread state; a present is Sample() -> EndDraw() ->
+ * ReadbackDue()/OnPresentedPixels() in that order. */
+static int pw_enabled = -1;
+static int pw_threshold = 10;
+static int pw_strict;
+static int pw_force_submit;
+static int pw_force_present;
+static int pw_force_frames;
+static int pw_readback_every = 20;
+static unsigned pw_presents;
+static unsigned pw_submit_consec, pw_submit_last_log;
+static double pw_submit_since;
+static bool pw_submit_black;        /* last submitted frame's black result */
+static bool pw_submit_visible;      /* INIDISP bit 7 clear for that frame */
+static unsigned pw_submit_inidisp, pw_submit_bgmode;
+static bool pw_submit_region_black; /* same region inside the submitted frame */
+static int pw_present_x, pw_present_y, pw_present_w, pw_present_h;
+static bool pw_readback_pending;
+static unsigned pw_presenter_consec, pw_presenter_last_log;
+static double pw_presenter_since;
+static bool pw_readback_warned;
+
+static void PresentWatch_Init(void) {
+  const char *v = HostGetenv("PRESENT_WATCH");
+  pw_enabled = v ? atoi(v) != 0 : 1;
+  v = HostGetenv("PRESENT_WATCH_N");
+  pw_threshold = v ? atoi(v) : 10;
+  if (pw_threshold < 1) pw_threshold = 1;
+  v = HostGetenv("PRESENT_WATCH_FORCE");
+  if (v && !strcmp(v, "present")) {
+    /* =present: lie about the READBACK, not the submitted frame, so the
+     * PRESENTER_BLACK path (bright submit + black window) is exercised. */
+    pw_force_present = 1;
+  } else {
+    pw_force_submit = v && atoi(v) != 0;
+  }
+  v = HostGetenv("PRESENT_WATCH_FORCE_FRAMES");
+  pw_force_frames = v ? atoi(v) : 0;
+  v = HostGetenv("PRESENT_WATCH_STRICT");
+  pw_strict = v && atoi(v) != 0;
+  v = HostGetenv("PRESENT_READBACK_EVERY");
+  pw_readback_every = v ? atoi(v) : 20;
+  if (pw_readback_every < 0) pw_readback_every = 0;
+}
+
+/* The presenters publish the viewport they drew into (window coordinates) so
+ * the submitted frame can be compared on the SAME region the readback will
+ * sample. Without this, a legitimately black centre (the intro's copyright
+ * screen, a dark cave with a HUD at the edges) would look like a presenter
+ * failure. Called from BeginDraw, before Sample. */
+void PresentWatch_NotePresenterRect(int x, int y, int w, int h) {
+  pw_present_x = x;
+  pw_present_y = y;
+  pw_present_w = w;
+  pw_present_h = h;
+}
+
+static void PresentWatch_Sample(const uint8 *pixels, int pitch, int w, int h) {
+  if (pw_enabled < 0) PresentWatch_Init();
+  if (!pw_enabled) return;
+  ++pw_presents;
+
+  bool black = PresentWatch_FrameIsBlack(pixels, pitch, w, h);
+  if (pw_force_submit &&
+      (pw_force_frames <= 0 || pw_presents <= (unsigned)pw_force_frames))
+    black = true;
+  pw_submit_black = black;
+  const unsigned inidisp = g_ppu ? g_ppu->inidisp : 0;
+  const unsigned bgmode = g_ppu ? (g_ppu->bgmode & 7) : 0;
+  pw_submit_inidisp = inidisp;
+  pw_submit_bgmode = bgmode;
+  /* "The guest says visible": display enabled, not at zero brightness, and not
+   * inside a WRAM-resident trampoline. INIDISP bit 7 clear alone is too weak
+   * for this title: its intro cuts to a full-screen black gap between scenes
+   * (copyright -> pendulum), with bit 7 clear and CGRAM/VRAM loaded, and runs
+   * those cinematics from bank $7E. Those gaps are healthy and must stay
+   * silent, so they are excluded by default; STRICT restores the literal test.
+   * The reported failure is a battle presented black with INIDISP=$0F while
+   * running in a battle bank, which none of these exclusions touches. */
+  const bool guest_visible = (inidisp & 0x80) == 0;
+  const bool benign_context = !pw_strict &&
+      ((inidisp & 0x0F) < 8 || g_cpu.PB == 0x7E);
+  pw_submit_visible = guest_visible;
+  if (!black || !guest_visible || benign_context) {
+    if (pw_submit_consec >= (unsigned)pw_threshold) {
+      const double duration = MonotonicSeconds() - pw_submit_since;
+      fprintf(stderr,
+              "[present_watch] SUBMIT_RECOVERED sim_frame=%u guest_frame=%d present=%u consec=%u "
+              "duration_ms=%.0f inidisp=0x%02X bgmode=%u renderer=%s active=%s\n",
+              g_present_frame, snes_frame_counter, pw_presents, pw_submit_consec,
+              duration * 1000.0, inidisp, bgmode,
+              g_config.renderer, PresentWatch_ActiveRenderer());
+      host_report_breadcrumb("present_watch: submit recovered after %u black presents (%.0f ms)",
+                             pw_submit_consec, duration * 1000.0);
+    }
+    pw_submit_consec = 0;
+  } else {
+    if (pw_submit_consec == 0) {
+      pw_submit_since = MonotonicSeconds();
+      pw_submit_last_log = pw_presents;
+    }
+    ++pw_submit_consec;
+    if (pw_submit_consec == (unsigned)pw_threshold ||
+        (pw_submit_consec > (unsigned)pw_threshold &&
+         pw_presents - pw_submit_last_log >= 60)) {
+      int win_w = 0, win_h = 0;
+      if (g_window) SDL_GetWindowSize(g_window, &win_w, &win_h);
+      const char *bmp = "-";
+      char path[160];
+      if (pw_submit_consec == (unsigned)pw_threshold) {
+        /* One artifact per episode, at the first report. */
+        MkDir("saves");
+        MkDir("saves/diag");
+        snprintf(path, sizeof(path), "saves/diag/black_%u.bmp", g_present_frame);
+        bmp = PresentWatch_WriteBmp(path, pixels, pitch, w, h, false, true)
+                  ? path : "(write failed)";
+        host_report_breadcrumb("present_watch: submit black at frame %u, bmp %s",
+                               g_present_frame, bmp);
+      }
+      fprintf(stderr,
+              "[present_watch] SUBMIT_BLACK sim_frame=%u guest_frame=%d present=%u consec=%u "
+              "inidisp=0x%02X bgmode=%u renderer=%s active=%s output=%u new_renderer=%d "
+              "pb=0x%02X battle_bank=%d window=%dx%d size=%dx%d bmp=%s\n",
+              g_present_frame, snes_frame_counter, pw_presents, pw_submit_consec,
+              inidisp, bgmode, g_config.renderer, PresentWatch_ActiveRenderer(),
+              (unsigned)g_config.output_method,
+              g_new_ppu ? 1 : 0, (unsigned)g_cpu.PB,
+              PresentWatch_BattleBank((uint32)g_cpu.PB), win_w, win_h, w, h, bmp);
+      fflush(stderr);
+      pw_submit_last_log = pw_presents;
+    }
+  }
+
+  if (pw_readback_every > 0) {
+    if (pw_presents % (unsigned)pw_readback_every == 0)
+      pw_readback_pending = true;
+    /* On a present that will read the window back, also test the matching
+     * region of the SUBMITTED frame. The readback is the centred
+     * min(256,viewport) x min(224,viewport) rectangle, so map that rectangle
+     * through the viewport into frame pixels. If the submitted region is
+     * itself black, the presenter is faithfully showing black content and
+     * must not be reported. */
+    if (pw_readback_pending) {
+      if (pw_present_w > 0 && pw_present_h > 0) {
+        int rw = pw_present_w < 256 ? pw_present_w : 256;
+        int rh = pw_present_h < 224 ? pw_present_h : 224;
+        int sx = (int)((long long)((pw_present_w - rw) / 2) * w / pw_present_w);
+        int sy = (int)((long long)((pw_present_h - rh) / 2) * h / pw_present_h);
+        int sw = (int)((long long)rw * w / pw_present_w);
+        int sh = (int)((long long)rh * h / pw_present_h);
+        if (sw < 1) sw = 1;
+        if (sh < 1) sh = 1;
+        if (sx + sw > w) sx = w - sw;
+        if (sy + sh > h) sy = h - sh;
+        if (sx < 0) sx = 0;
+        if (sy < 0) sy = 0;
+        pw_submit_region_black =
+            PresentWatch_RectIsBlack(pixels, pitch, sx, sy, sw, sh);
+      } else {
+        pw_submit_region_black = black;
+      }
+    }
+  }
+}
+
+/* ── Throttled readback of the presented window ────────────────────────────
+ *
+ * The submitted-frame check above cannot see a failure after the upload. This
+ * second check reads a small rectangle back from the render target at present
+ * time, every SNESRECOMP_PRESENT_READBACK_EVERY presents (default 20; 0 off):
+ *
+ *   SDL presenter  SDL_RenderReadPixels on the current render target, after
+ *                  SDL_RenderTexture and BEFORE SDL_RenderPresent. After the
+ *                  present the backbuffer contents are undefined, so before is
+ *                  the only point that reflects the frame being published.
+ *   OpenGL         glReadPixels(GL_RGBA, GL_UNSIGNED_BYTE) from GL_BACK of the
+ *                  default framebuffer, after the draw and BEFORE
+ *                  SDL_GL_SwapWindow. GL_BACK is the buffer the swap publishes.
+ *
+ * Both read a centred min(256, viewport) x min(224, viewport) rectangle of the
+ * image, so letterbox bars cannot make a healthy frame look black. The result
+ * goes through the same max-channel<8 lattice test, and is reported only when
+ * the submitted frame for that present was NOT black: that is the
+ * PRESENTER_BLACK signal. It proves the window's render target is black while
+ * the host handed the presenter a bright frame; it still cannot prove the OS
+ * compositor or the display link did not fail after the swap.
+ *
+ * Cost: one small readback every N presents (default: one 256x224 readback
+ * every 20 presents, ~3/s at 60 fps), into a static buffer. No per-frame
+ * allocation; the readback itself can stall the GPU, which is why it is
+ * throttled. Minimized/hidden/occluded windows are skipped when SDL reports
+ * the state.
+ */
+int PresentWatch_ReadbackDue(void) {
+  if (pw_enabled <= 0 || pw_readback_every <= 0 || !pw_readback_pending)
+    return 0;
+  if (g_window) {
+    SDL_WindowFlags flags = SDL_GetWindowFlags(g_window);
+    SDL_WindowFlags skip = SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN;
+#ifdef SDL_WINDOW_OCCLUDED
+    skip |= SDL_WINDOW_OCCLUDED;
+#endif
+    if (flags & skip) return 0;   /* keep pending; try when it is visible */
+  }
+  pw_readback_pending = false;
+  return 1;
+}
+
+void PresentWatch_ReadbackFailed(const char *path) {
+  if (pw_readback_warned) return;
+  pw_readback_warned = true;
+  fprintf(stderr, "[present_watch] readback unavailable on the %s path (%s); "
+                  "PRESENTER_BLACK cannot be evaluated while readback fails\n",
+          path, SDL_GetError());
+  host_report_breadcrumb("present_watch: %s readback unavailable: %s",
+                         path, SDL_GetError());
+}
+
+void PresentWatch_OnPresentedPixels(const uint8 *pixels, int pitch, int w, int h,
+                                    int bottom_up, int bgra, const char *path,
+                                    double readback_ms) {
+  if (pw_enabled <= 0) return;
+  /* Not evaluable: a black submitted frame is the other watcher's business;
+   * a blank guest is expected to be black; and when the submitted region that
+   * maps to the readback is itself black, the presenter is showing the black
+   * content it was given. Leave an open episode alone so we neither invent a
+   * recovery nor lose the count. */
+  if (pw_submit_black || !pw_submit_visible || pw_submit_region_black) return;
+
+  bool black = PresentWatch_FrameIsBlack(pixels, pitch, w, h);
+  if (pw_force_present &&
+      (pw_force_frames <= 0 || pw_presents <= (unsigned)pw_force_frames))
+    black = true;
+
+  if (!black) {
+    if (pw_presenter_consec > 0) {
+      const double duration = MonotonicSeconds() - pw_presenter_since;
+      fprintf(stderr,
+              "[present_watch] PRESENTER_RECOVERED sim_frame=%u guest_frame=%d present=%u "
+              "consec=%u duration_ms=%.0f path=%s readback=%dx%d readback_ms=%.3f\n",
+              g_present_frame, snes_frame_counter, pw_presents, pw_presenter_consec,
+              duration * 1000.0, path, w, h, readback_ms);
+      host_report_breadcrumb("present_watch: presenter recovered after %u readbacks (%.0f ms)",
+                             pw_presenter_consec, duration * 1000.0);
+      pw_presenter_consec = 0;
+    }
+    return;
+  }
+
+  if (pw_presenter_consec == 0) {
+    pw_presenter_since = MonotonicSeconds();
+    pw_presenter_last_log = pw_presents;
+  }
+  ++pw_presenter_consec;
+  if (pw_presenter_consec != 1 &&
+      !(pw_presenter_consec > 1 && pw_presents - pw_presenter_last_log >= 60))
+    return;
+
+  int win_w = 0, win_h = 0;
+  if (g_window) SDL_GetWindowSize(g_window, &win_w, &win_h);
+  const char *bmp = "-";
+  char file[160];
+  if (pw_presenter_consec == 1) {
+    MkDir("saves");
+    MkDir("saves/diag");
+    snprintf(file, sizeof(file), "saves/diag/present_black_%u.bmp", g_present_frame);
+    bmp = PresentWatch_WriteBmp(file, pixels, pitch, w, h, bottom_up != 0, bgra != 0)
+              ? file : "(write failed)";
+    host_report_breadcrumb("present_watch: presenter black at frame %u, bmp %s",
+                           g_present_frame, bmp);
+  }
+  fprintf(stderr,
+          "[present_watch] PRESENTER_BLACK sim_frame=%u guest_frame=%d present=%u consec=%u "
+          "inidisp=0x%02X bgmode=%u pb=0x%02X battle_bank=%d renderer=%s active=%s "
+          "path=%s window=%dx%d readback=%dx%d readback_ms=%.3f bmp=%s\n",
+          g_present_frame, snes_frame_counter, pw_presents, pw_presenter_consec,
+          pw_submit_inidisp, pw_submit_bgmode, (unsigned)g_cpu.PB,
+          PresentWatch_BattleBank((uint32)g_cpu.PB), g_config.renderer,
+          PresentWatch_ActiveRenderer(), path, win_w, win_h, w, h,
+          readback_ms, bmp);
+  fflush(stderr);
+  pw_presenter_last_log = pw_presents;
+}
+
 static void DrawPpuFrameWithPerf(void) {
   double profile_start = ProfileStart();
   PreparePpuFrame();
@@ -1362,6 +1774,9 @@ static void DrawPpuFrameWithPerf(void) {
   }
 #endif
 
+  /* Watch the exact pixels EndDraw is about to upload/present. */
+  PresentWatch_Sample(pixel_buffer, pitch, g_snes_width * render_scale,
+                      g_snes_height * render_scale);
   ProfileEnd(kProfileCompose, profile_start);
   profile_start = ProfileStart();
   g_renderer_funcs.EndDraw();
@@ -2147,6 +2562,8 @@ static void SdlRenderer_BeginDraw(int width, int height, uint8 **pixels, int *pi
   g_sdl_present_rect.h = viewport.height;
   g_sdl_renderer_rect.w = width;
   g_sdl_renderer_rect.h = height;
+  PresentWatch_NotePresenterRect(viewport.x, viewport.y,
+                                 viewport.width, viewport.height);
   if (!snesrecomp_sdl_lock_texture(g_texture, &g_sdl_renderer_rect,
                                    (void **)pixels, pitch)) {
     printf("Failed to lock texture: %s\n", SDL_GetError());
@@ -2161,6 +2578,31 @@ static void SdlRenderer_EndDraw(void) {
   /* SDL3's SDL_RenderTexture takes SDL_FRect, not SDL_Rect. */
   snesrecomp_sdl_render_texture(g_renderer, g_texture, &g_sdl_renderer_rect,
                                 &g_sdl_present_rect);
+  /* Throttled presented-buffer readback: the render target still holds the
+   * frame about to be published. After SDL_RenderPresent its contents are
+   * undefined, so this is the only point on this path that reflects the
+   * window. Centre rectangle, so letterbox bars cannot read as black. */
+  if (PresentWatch_ReadbackDue() && g_sdl_present_rect.w > 0 &&
+      g_sdl_present_rect.h > 0) {
+    int rw = g_sdl_present_rect.w < 256 ? g_sdl_present_rect.w : 256;
+    int rh = g_sdl_present_rect.h < 224 ? g_sdl_present_rect.h : 224;
+    SDL_Rect r = {
+      g_sdl_present_rect.x + (g_sdl_present_rect.w - rw) / 2,
+      g_sdl_present_rect.y + (g_sdl_present_rect.h - rh) / 2,
+      rw, rh,
+    };
+    static uint8 sdl_readback[256 * 224 * 4];
+    Uint64 t0 = SDL_GetPerformanceCounter();
+    int ok = snesrecomp_sdl_render_read_pixels(g_renderer, &r, sdl_readback,
+                                               rw * 4);
+    double ms = 1000.0 * (double)(SDL_GetPerformanceCounter() - t0) /
+                (double)SDL_GetPerformanceFrequency();
+    if (ok)
+      PresentWatch_OnPresentedPixels(sdl_readback, rw * 4, rw, rh,
+                                     /*bottom_up=*/0, /*bgra=*/1, "SDL", ms);
+    else
+      PresentWatch_ReadbackFailed("SDL");
+  }
   SDL_RenderPresent(g_renderer);
 }
 
@@ -2189,6 +2631,19 @@ void MkDir(const char *s) {
 #else
   mkdir(s, 0755);
 #endif
+}
+
+/* The presenter actually in use, for the present watcher's log: the config id
+ * ("auto", "opengl", "software", a driver name) says what was asked for, while
+ * an Auto choice hides which SDL driver was picked. */
+static const char *PresentWatch_ActiveRenderer(void) {
+  if (g_config.output_method == kOutputMethod_OpenGL) return "opengl";
+  if (g_renderer) {
+    const char *name = snesrecomp_sdl_renderer_name(g_renderer);
+    if (name && name[0]) return name;
+  }
+  if (g_config.renderer[0]) return g_config.renderer;
+  return g_config.output_method == kOutputMethod_SDLSoftware ? "software" : "sdl";
 }
 
 /* ── Crash pipeline ───────────────────────────────────────────────────────── */
@@ -4139,6 +4594,12 @@ static void HandleCommand(uint32 j, bool pressed) {
     case kKeys_ToggleRenderer:
       g_ppu_render_flags ^= kPpuRenderFlags_NewRenderer;
       printf("New renderer = %x\n", g_ppu_render_flags & kPpuRenderFlags_NewRenderer);
+      fprintf(stderr, "[present_watch] ToggleRenderer sim_frame=%u NewRenderer=%d "
+                      "renderer=%s active=%s output=%u\n",
+              g_present_frame,
+              (g_ppu_render_flags & kPpuRenderFlags_NewRenderer) ? 1 : 0,
+              g_config.renderer, PresentWatch_ActiveRenderer(),
+              (unsigned)g_config.output_method);
       g_new_ppu = g_ws_active ||
                   (g_ppu_render_flags & kPpuRenderFlags_NewRenderer) != 0;
       break;
