@@ -5059,18 +5059,99 @@ static void cmd_quick_save(const char *args) {
         send_fmt("{\"error\":\"quick save failed (see stderr)\"}");
         return;
     }
-    send_fmt("{\"ok\":true,\"file\":\"%s\",\"bytes\":%zu,\"format\":\"rollback-v2\"}",
-             path, bytes);
+    send_fmt("{\"ok\":true,\"file\":\"%s\",\"bytes\":%zu,\"format\":\"rollback-v2\","
+             "\"index\":%d,\"count\":%d}",
+             path, bytes, SnesQuickStateSelectedIndex(), SnesQuickStateCount());
 }
 
 static void cmd_quick_load(const char *args) {
     (void)args;
     char path[SNES_QUICKSTATE_PATH_MAX];
+    int idx = SnesQuickStateSelectedIndex();
+    int count = SnesQuickStateCount();
     if (!SnesQuickStateLoad(path, sizeof(path))) {
         send_fmt("{\"error\":\"quick load failed (see stderr)\"}");
         return;
     }
-    send_fmt("{\"ok\":true,\"file\":\"%s\",\"format\":\"rollback-v2\"}", path);
+    send_fmt("{\"ok\":true,\"file\":\"%s\",\"format\":\"rollback-v2\","
+             "\"index\":%d,\"count\":%d}", path, idx, count);
+}
+
+// quick_prev / quick_next -- the same SnesQuickStateStep() the L4/R4 hotkeys
+// call. `osd` is the exact player-facing string the toast shows.
+static void cmd_quick_step(int delta) {
+    char msg[SNES_QUICKSTATE_OSD_MAX];
+    msg[0] = 0;
+    bool moved = SnesQuickStateStep(delta, msg, sizeof(msg));
+    int count = SnesQuickStateCount();
+    if (!moved) {
+        send_fmt("{\"ok\":false,\"error\":\"no states\",\"count\":0,\"osd\":\"%s\"}", msg);
+        return;
+    }
+    send_fmt("{\"ok\":true,\"index\":%d,\"count\":%d,\"osd\":\"%s\"}",
+             SnesQuickStateSelectedIndex(), count, msg);
+}
+
+static void cmd_quick_prev(const char *args) {
+    (void)args;
+    cmd_quick_step(-1);
+}
+
+static void cmd_quick_next(const char *args) {
+    (void)args;
+    cmd_quick_step(1);
+}
+
+// quick_load_index <n> -- 0 is the OLDEST ct_*.l3, count-1 the newest.
+static void cmd_quick_load_index(const char *args) {
+    int idx = -1;
+    if (!args || sscanf(args, "%d", &idx) != 1) {
+        send_fmt("{\"error\":\"usage: quick_load_index <n> (0 = oldest)\"}");
+        return;
+    }
+    char path[SNES_QUICKSTATE_PATH_MAX];
+    if (!SnesQuickStateLoadIndex(idx, path, sizeof(path))) {
+        send_fmt("{\"error\":\"quick_load_index %d failed (out of range or "
+                 "unreadable; see stderr)\",\"count\":%d}",
+                 idx, SnesQuickStateCount());
+        return;
+    }
+    send_fmt("{\"ok\":true,\"index\":%d,\"count\":%d,\"file\":\"%s\","
+             "\"format\":\"rollback-v2\"}",
+             idx, SnesQuickStateCount(), path);
+}
+
+// quick_list -- the sorted stash (oldest first), the selected index, and the
+// display line each index would toast. `newest` is the last entry.
+static void cmd_quick_list(const char *args) {
+    (void)args;
+    int count = SnesQuickStateCount();
+    int selected = SnesQuickStateSelectedIndex();
+    char buf[8192];
+    int off = snprintf(buf, sizeof(buf),
+                       "{\"ok\":true,\"count\":%d,\"selected\":%d,"
+                       "\"newest\":%d,\"states\":[",
+                       count, selected, count > 0 ? count - 1 : -1);
+    for (int i = 0; i < count && off < (int)sizeof(buf) - 256; i++) {
+        char path[SNES_QUICKSTATE_PATH_MAX];
+        char display[SNES_QUICKSTATE_OSD_MAX];
+        if (!SnesQuickStatePathAt(i, path, sizeof(path))) continue;
+        if (!SnesQuickStateDescribeIndex(i, display, sizeof(display)))
+            display[0] = 0;
+        const char *base = strrchr(path, '/');
+#if defined(_WIN32)
+        const char *bs = strrchr(path, '\\');
+        if (bs && (!base || bs > base)) base = bs;
+#endif
+        base = base ? base + 1 : path;
+        off += snprintf(buf + off, sizeof(buf) - off,
+                        "%s{\"index\":%d,\"file\":\"%s\",\"selected\":%s,"
+                        "\"display\":\"%s\"}",
+                        i ? "," : "", i, base, i == selected ? "true" : "false",
+                        display);
+    }
+    snprintf(buf + off, sizeof(buf) - off, "]}");
+    send_fmt("%s", buf);
 }
 
 // write_cart <rom_offset_hex> <hex_bytes> — live debug patch of the in-memory
@@ -9335,6 +9416,10 @@ static const CmdEntry s_commands[] = {
     {"load_state",    cmd_load_state},
     {"quick_save",    cmd_quick_save},
     {"quick_load",    cmd_quick_load},
+    {"quick_prev",    cmd_quick_prev},
+    {"quick_next",    cmd_quick_next},
+    {"quick_load_index", cmd_quick_load_index},
+    {"quick_list",    cmd_quick_list},
     {"invoke_recomp", cmd_invoke_recomp},
     {"call_func",     cmd_call_func},
     {"call_func_lle", cmd_call_func_lle},

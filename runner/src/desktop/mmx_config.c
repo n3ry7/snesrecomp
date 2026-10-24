@@ -6,6 +6,7 @@
 #include "types.h"
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "sdl_compat.h"
 #include "util.h"
@@ -80,6 +81,11 @@ static uint16 kDefaultKbdControls[kKeys_Total] = {
    * an existing config.ini that still says Load = F1..F10. */
   _(SDLK_F5),
   _(SDLK_F9),
+  /* Stash selection. SDL_GetKeyFromName() does not know the "Left Bracket"
+   * spelling, so ParseKeyArray maps it explicitly; the config still reads the
+   * way a player would say the key. */
+  _(SDLK_LEFTBRACKET),
+  _(SDLK_RIGHTBRACKET),
 };
 /* Opt in before parsing: existing hosts keep their legacy slot defaults. */
 void ConfigUseStateMenuDefaults(void) {
@@ -115,6 +121,10 @@ static const KeyNameId kKeyNameId[] = {
   S(Pause), S(PauseDimmed), S(Turbo), S(WindowBigger), S(WindowSmaller), S(VolumeUp), S(VolumeDown), S(DisplayPerf), S(ToggleRenderer), S(ToggleWidescreen),
   S(SaveStateMenu), S(Rewind), S(Screenshot), S(OpenLauncher),
   S(QuickSave), S(QuickLoad),
+  /* The player-facing config names are PrevState / NextState; the enum says
+   * QuickState because the pair belongs to the quick-state stash. */
+  {"PrevState", kKeys_PrevQuickState, 1},
+  {"NextState", kKeys_NextQuickState, 1},
 };
 #undef S
 #undef M
@@ -219,6 +229,14 @@ static void ParseKeyArray(char *value, int cmd, int size) {
       }
     }
     SDL_Keycode key = SDL_GetKeyFromName(s);
+    /* SDL documents the physical key as "Left Bracket" / "Right Bracket", but
+     * SDL_GetKeyFromName() only accepts the punctuation glyph ("[" / "]") for
+     * this pair. The generated config uses the readable spelling, so accept it
+     * here rather than making every player discover the glyph. */
+    if (key == SDLK_UNKNOWN && StringEqualsNoCase(s, "Left Bracket"))
+      key = SDLK_LEFTBRACKET;
+    else if (key == SDLK_UNKNOWN && StringEqualsNoCase(s, "Right Bracket"))
+      key = SDLK_RIGHTBRACKET;
     /* Old config.ini files loaded slots 7/8 on the new shared menu keys.
      * Migrate those two defaults without rewriting the user's config. */
     if (s_state_menu_defaults && !key_with_mod && cmd == kKeys_Load + 6 && key == SDLK_F7) key = SDLK_F11;
@@ -246,26 +264,31 @@ static void ParseKeyArray(char *value, int cmd, int size) {
 }
 
 typedef struct GamepadMapEnt {
-  uint32 modifiers;
+  uint64 modifiers;
   uint16 cmd, next;
 } GamepadMapEnt;
 
-static uint16 joymap_first[kGamepadBtn_Count * 2];  // 2 gamepads
+/* kGamepadBtn_Slots per player, not kGamepadBtn_Count: the extra slots hold
+ * numbered `button:N` bindings (see ParseGamepadButtonName). */
+static uint16 joymap_first[kGamepadBtn_Slots * 2];  // 2 gamepads
 static GamepadMapEnt *joymap_ents;
 static int joymap_size;
 static uint8 has_assigned_joypad_controls;
 /* Set when [GamepadMap] named QuickSave or QuickLoad, so the R2/L2 defaults
  * are not registered on top of a player's own binding. */
 static bool s_quick_gamepad_seen;
+/* Bit 0/1: [GamepadMap] named PrevState/NextState. Kept per key so a player
+ * who rebinds only one of the pair keeps the default for the other. */
+static uint8 s_state_cycle_gamepad_seen;
 
-static int CountBits32(uint32 n) {
+static int CountBits64(uint64 n) {
   int count = 0;
   for (; n != 0; count++)
     n &= (n - 1);
   return count;
 }
 
-static void GamepadMap_Add(int button, uint32 modifiers, uint16 cmd) {
+static void GamepadMap_Add(int button, uint64 modifiers, uint16 cmd) {
   /* Grow every 64 entries, which is the 64 this grows BY. The test was
    * `(joymap_size & 0xff) == 0` -- a check every 256 against an allocation of
    * 64 -- so entry 64 wrote one element past the block and quietly corrupted
@@ -280,8 +303,8 @@ static void GamepadMap_Add(int button, uint32 modifiers, uint16 cmd) {
   }
   uint16 *p = &joymap_first[button];
   // Insert it as early as possible but before after any entry with more modifiers.
-  int cb = CountBits32(modifiers);
-  while (*p && cb < CountBits32(joymap_ents[*p - 1].modifiers))
+  int cb = CountBits64(modifiers);
+  while (*p && cb < CountBits64(joymap_ents[*p - 1].modifiers))
     p = &joymap_ents[*p - 1].next;
   int i = joymap_size++;
   GamepadMapEnt *ent = &joymap_ents[i];
@@ -291,7 +314,7 @@ static void GamepadMap_Add(int button, uint32 modifiers, uint16 cmd) {
   *p = i + 1;
 }
 
-int FindCmdForGamepadButton(int button, uint32 modifiers) {
+int FindCmdForGamepadButton(int button, uint64 modifiers) {
   GamepadMapEnt *ent;
   for(int e = joymap_first[button]; e != 0; e = ent->next) {
     ent = &joymap_ents[e - 1];
@@ -303,15 +326,31 @@ int FindCmdForGamepadButton(int button, uint32 modifiers) {
 
 static int ParseGamepadButtonName(const char **value) {
   const char *s = *value;
+  /* button:N -- a numbered SDL gamepad button, or a raw joystick's button
+   * index, for a back button SDL does not name. N is 0..31; the probe
+   * (SNESRECOMP_GAMEPAD_PROBE=1) prints the numbers a device reports. */
+  {
+    const char *r = StringStartsWithNoCase(s, "button:");
+    if (r) {
+      char *end = NULL;
+      long n = strtol(r, &end, 10);
+      if (end == r || n < 0 || n >= kGamepadBtn_Slots - kGamepadBtn_ButtonBase)
+        return kGamepadBtn_Invalid;
+      *value = end;
+      return kGamepadBtn_ButtonBase + (int)n;
+    }
+  }
   // Longest substring first
   static const char *const kGamepadKeyNames[] = {
     "Back", "Guide", "Start", "L3", "R3",
     "L1", "R1", "DpadUp", "DpadDown", "DpadLeft", "DpadRight", "L2", "R2",
+    "L4", "R4",
     "Lb", "Rb", "A", "B", "X", "Y"
   };
   static const uint8 kGamepadKeyIds[] = {
     kGamepadBtn_Back, kGamepadBtn_Guide, kGamepadBtn_Start, kGamepadBtn_L3, kGamepadBtn_R3,
     kGamepadBtn_L1, kGamepadBtn_R1, kGamepadBtn_DpadUp, kGamepadBtn_DpadDown, kGamepadBtn_DpadLeft, kGamepadBtn_DpadRight, kGamepadBtn_L2, kGamepadBtn_R2,
+    kGamepadBtn_L4, kGamepadBtn_R4,
     kGamepadBtn_L1, kGamepadBtn_R1, kGamepadBtn_A, kGamepadBtn_B, kGamepadBtn_X, kGamepadBtn_Y,
   };
   for (size_t i = 0; i != countof(kGamepadKeyNames); i++) {
@@ -336,7 +375,7 @@ static void ParseGamepadArray(int gamepad, char *value, int cmd, int size) {
     if (*s == 0)
       continue;
     int gamepad_cur = gamepad;
-    uint32 modifiers = 0;
+    uint64 modifiers = 0;
     const char *ss = s;
     for (;;) {
       int button = ParseGamepadButtonName(&ss);
@@ -347,9 +386,9 @@ static void ParseGamepadArray(int gamepad, char *value, int cmd, int size) {
       while (*ss == ' ' || *ss == '\t') ss++;
       if (*ss == '+') {
         ss++;
-        modifiers |= 1 << button;
+        modifiers |= 1ull << button;
       } else if (*ss == 0) {
-        GamepadMap_Add(button + gamepad_cur * kGamepadBtn_Count, modifiers, cmd);
+        GamepadMap_Add(button + gamepad_cur * kGamepadBtn_Slots, modifiers, cmd);
         break;
       } else
         goto BAD;
@@ -371,7 +410,7 @@ static void RegisterDefaultKeys(void) {
   }
   if (!(has_assigned_joypad_controls & 2)) {
     for (int i = 0; i < countof(kDefaultGamepadCmds); i++)
-      GamepadMap_Add(kDefaultGamepadCmds[i] + kGamepadBtn_Count, 0, kKeys_ControlsP2 + i);
+      GamepadMap_Add(kDefaultGamepadCmds[i] + kGamepadBtn_Slots, 0, kKeys_ControlsP2 + i);
   }
   /* Quick save / quick load on player 1's analog triggers. Kept out of the
    * Controls block above: every existing config.ini has Controls, so that
@@ -381,6 +420,13 @@ static void RegisterDefaultKeys(void) {
     GamepadMap_Add(kGamepadBtn_R2, 0, kKeys_QuickSave);
     GamepadMap_Add(kGamepadBtn_L2, 0, kKeys_QuickLoad);
   }
+  /* The stash-selection pair on the back paddles. Same reasoning as the
+   * triggers: no existing config.ini names them, so they are registered here
+   * rather than in the Controls block (which upgrades skip). */
+  if (!(s_state_cycle_gamepad_seen & 1))
+    GamepadMap_Add(kGamepadBtn_L4, 0, kKeys_PrevQuickState);
+  if (!(s_state_cycle_gamepad_seen & 2))
+    GamepadMap_Add(kGamepadBtn_R4, 0, kKeys_NextQuickState);
 }
 
 static int GetIniSection(const char *s) {
@@ -487,6 +533,8 @@ static bool HandleIniConfig(int section, const char *key, char *value) {
           has_assigned_joypad_controls |= (id == kKeys_Controls) ? 1 : (id == kKeys_ControlsP2) ? 2 : 0;
           if (id == kKeys_QuickSave || id == kKeys_QuickLoad)
             s_quick_gamepad_seen = true;
+          if (id == kKeys_PrevQuickState) s_state_cycle_gamepad_seen |= 1;
+          if (id == kKeys_NextQuickState) s_state_cycle_gamepad_seen |= 2;
           ParseGamepadArray(id == kKeys_ControlsP2 ? 1 : 0, value, kKeyNameId[i].id, kKeyNameId[i].size);
           return true;
         }
@@ -803,6 +851,7 @@ void ConfigReloadGamepadMap(const char *filename) {
   joymap_size = 0;
   has_assigned_joypad_controls = 0;
   s_quick_gamepad_seen = false;
+  s_state_cycle_gamepad_seen = 0;
 
   ReloadSection(filename, "[GamepadMap]", 5, true);
 
@@ -813,12 +862,16 @@ void ConfigReloadGamepadMap(const char *filename) {
   }
   if (!(has_assigned_joypad_controls & 2)) {
     for (int i = 0; i < countof(kDefaultGamepadCmds); i++)
-      GamepadMap_Add(kDefaultGamepadCmds[i] + kGamepadBtn_Count, 0, kKeys_ControlsP2 + i);
+      GamepadMap_Add(kDefaultGamepadCmds[i] + kGamepadBtn_Slots, 0, kKeys_ControlsP2 + i);
   }
   if (!s_quick_gamepad_seen) {
     GamepadMap_Add(kGamepadBtn_R2, 0, kKeys_QuickSave);
     GamepadMap_Add(kGamepadBtn_L2, 0, kKeys_QuickLoad);
   }
+  if (!(s_state_cycle_gamepad_seen & 1))
+    GamepadMap_Add(kGamepadBtn_L4, 0, kKeys_PrevQuickState);
+  if (!(s_state_cycle_gamepad_seen & 2))
+    GamepadMap_Add(kGamepadBtn_R4, 0, kKeys_NextQuickState);
 }
 
 /* ---------------------------------------------------------------------------

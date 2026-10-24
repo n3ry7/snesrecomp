@@ -169,20 +169,91 @@ static int qs_name_cmp(const void *a, const void *b) {
   return strcmp(*(char *const *)a, *(char *const *)b);
 }
 
+/* Names of the stash files, sorted oldest-first (lexicographic order is
+ * chronological order for ct_<stamp>_<seq>.l3). */
+static int qs_list(const char *dir, char ***out_names) {
+  int n = qs_scan(dir, out_names);
+  if (n > 1) qsort(*out_names, (size_t)n, sizeof(char *), qs_name_cmp);
+  return n;
+}
+
+/* ── selection ───────────────────────────────────────────────────────────── */
+
+/* Tracked by file name: index arithmetic would silently retarget the
+ * selection whenever a newer state is saved or the oldest one is pruned. */
+static char s_selected_name[128];
+static bool s_selected_set;
+
+static int qs_find_name(char **names, int n, const char *name) {
+  if (!name || !name[0]) return -1;
+  for (int i = 0; i < n; i++)
+    if (strcmp(names[i], name) == 0) return i;
+  return -1;
+}
+
+/* Index the player means: the selected file when it still exists, otherwise
+ * the newest state (the pre-selection L2/R2 behaviour). -1 when empty. */
+static int qs_current_index(char **names, int n) {
+  if (n <= 0) return -1;
+  if (s_selected_set) {
+    int i = qs_find_name(names, n, s_selected_name);
+    if (i >= 0) return i;
+  }
+  return n - 1;
+}
+
+static void qs_set_selected(const char *name) {
+  if (!name || !name[0]) {
+    s_selected_set = false;
+    s_selected_name[0] = 0;
+    return;
+  }
+  snprintf(s_selected_name, sizeof(s_selected_name), "%s", name);
+  s_selected_set = true;
+}
+
+/* "ct_20261024T114031_0001.l3" -> "2026-10-24 11:40:31". False when the name
+ * does not carry the expected stamp (a hand-renamed file). */
+static bool qs_parse_stamp(const char *name, char *out, size_t out_size) {
+  int Y, mo, d, h, mi, s;
+  if (sscanf(name, "ct_%4d%2d%2dT%2d%2d%2d", &Y, &mo, &d, &h, &mi, &s) != 6)
+    return false;
+  if (mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || s > 60)
+    return false;
+  snprintf(out, out_size, "%04d-%02d-%02d %02d:%02d:%02d", Y, mo, d, h, mi, s);
+  return true;
+}
+
+/* Player-facing line for a sorted-list index: index/total, the timestamp
+ * embedded in the file name, and a marker on the newest state. */
+static bool qs_describe(char **names, int n, int index, char *out,
+                        size_t out_size) {
+  if (index < 0 || index >= n) return false;
+  char when[40];
+  if (!qs_parse_stamp(names[index], when, sizeof(when)))
+    snprintf(when, sizeof(when), "(unknown time)");
+  snprintf(out, out_size, "State %d/%d  %s%s", index + 1, n, when,
+           index == n - 1 ? "  (newest)" : "");
+  return true;
+}
+
 /* Sort ascending (oldest first) and delete the oldest until at most
  * SNES_QUICKSTATE_MAX remain. `keep` (a basename, may be NULL) is never
- * deleted, even if a backwards clock made it sort oldest. */
+ * deleted, even if a backwards clock made it sort oldest; the selected state
+ * is protected the same way. After the deletions the selection is clamped to
+ * the nearest surviving entry if something outside this module removed it. */
 static void qs_prune(const char *dir, const char *keep) {
   char **names = NULL;
-  int n = qs_scan(dir, &names);
+  int n = qs_list(dir, &names);
   if (n <= SNES_QUICKSTATE_MAX) {
     qs_free_names(names, n);
     return;
   }
-  qsort(names, (size_t)n, sizeof(char *), qs_name_cmp);
+  int selected_before = qs_current_index(names, n);
   int to_remove = n - SNES_QUICKSTATE_MAX;
   for (int i = 0; i < n && to_remove > 0; i++) {
     if (keep && strcmp(names[i], keep) == 0) continue;
+    if (s_selected_set && strcmp(names[i], s_selected_name) == 0) continue;
     char path[SNES_QUICKSTATE_PATH_MAX];
     snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
     if (remove(path) == 0) {
@@ -193,6 +264,20 @@ static void qs_prune(const char *dir, const char *keep) {
     }
   }
   qs_free_names(names, n);
+
+  char **after = NULL;
+  int na = qs_list(dir, &after);
+  if (na == 0) {
+    qs_set_selected(NULL);
+  } else if (s_selected_set &&
+             qs_find_name(after, na, s_selected_name) < 0) {
+    int clamp = selected_before < 0 ? na - 1 : selected_before;
+    if (clamp >= na) clamp = na - 1;
+    if (clamp < 0) clamp = 0;
+    qs_set_selected(after[clamp]);
+    fprintf(stderr, "[quickstate] selection clamped to %s\n", after[clamp]);
+  }
+  qs_free_names(after, na);
 }
 
 /* ── snapshot file I/O (L3SN v2, byte-identical to debug_server.c) ───────── */
@@ -335,25 +420,125 @@ bool SnesQuickStateSave(char *out_path, size_t out_path_size, size_t *out_bytes)
   host_report_breadcrumb("quick save: %s (%zu bytes)", path, bytes);
 
   qs_prune(dir, name);
+  /* R2 selects what it just wrote, so L2 loads it without any further
+   * stepping (the newest state is the selected one). */
+  qs_set_selected(name);
+  fprintf(stderr, "[quickstate] selected newest %s\n", name);
 
   if (out_path && out_path_size) snprintf(out_path, out_path_size, "%s", path);
   if (out_bytes) *out_bytes = bytes;
   return true;
 }
 
+int SnesQuickStateCount(void) {
+  char **names = NULL;
+  int n = qs_list(s_state_dir, &names);
+  qs_free_names(names, n);
+  return n;
+}
+
+bool SnesQuickStatePathAt(int index, char *out_path, size_t out_path_size) {
+  char **names = NULL;
+  int n = qs_list(s_state_dir, &names);
+  bool ok = index >= 0 && index < n;
+  if (ok && out_path && out_path_size)
+    snprintf(out_path, out_path_size, "%s/%s", s_state_dir, names[index]);
+  qs_free_names(names, n);
+  return ok;
+}
+
+int SnesQuickStateSelectedIndex(void) {
+  char **names = NULL;
+  int n = qs_list(s_state_dir, &names);
+  int idx = qs_current_index(names, n);
+  qs_free_names(names, n);
+  return idx;
+}
+
+bool SnesQuickStateSelectIndex(int index) {
+  char **names = NULL;
+  int n = qs_list(s_state_dir, &names);
+  bool ok = index >= 0 && index < n;
+  if (ok) qs_set_selected(names[index]);
+  qs_free_names(names, n);
+  return ok;
+}
+
+bool SnesQuickStateDescribeIndex(int index, char *out_msg,
+                                 size_t out_msg_size) {
+  char **names = NULL;
+  int n = qs_list(s_state_dir, &names);
+  bool ok = qs_describe(names, n, index, out_msg, out_msg_size);
+  qs_free_names(names, n);
+  return ok;
+}
+
+bool SnesQuickStateStep(int delta, char *out_msg, size_t out_msg_size) {
+  char **names = NULL;
+  int n = qs_list(s_state_dir, &names);
+  if (n == 0) {
+    qs_free_names(names, n);
+    if (out_msg && out_msg_size) snprintf(out_msg, out_msg_size, "No saved states");
+    fprintf(stderr, "[quickstate] no states in %s\n", s_state_dir);
+    return false;
+  }
+  int cur = qs_current_index(names, n);
+  int next = cur + delta;
+  next %= n;
+  if (next < 0) next += n;
+  qs_set_selected(names[next]);
+  if (out_msg && out_msg_size) {
+    qs_describe(names, n, next, out_msg, out_msg_size);
+    fprintf(stderr, "[quickstate] %s\n", out_msg);
+  }
+  qs_free_names(names, n);
+  return true;
+}
+
+bool SnesQuickStateLoadIndex(int index, char *out_path, size_t out_path_size) {
+  char **names = NULL;
+  int n = qs_list(s_state_dir, &names);
+  if (index < 0 || index >= n) {
+    qs_free_names(names, n);
+    fprintf(stderr, "[quickstate] load index %d out of range (%d states)\n",
+            index, n);
+    return false;
+  }
+  char name[128];
+  snprintf(name, sizeof(name), "%s", names[index]);
+  char path[SNES_QUICKSTATE_PATH_MAX];
+  snprintf(path, sizeof(path), "%s/%s", s_state_dir, name);
+  qs_free_names(names, n);
+
+  fprintf(stderr, "[quickstate] loading index %d/%d %s\n", index + 1, n, name);
+  if (!qs_read_v2(path)) return false;
+  /* Loading an explicit index also selects it: the next L2 press is the
+   * state the player just chose, not whatever was selected before. */
+  qs_set_selected(name);
+  fprintf(stderr, "[quickstate] loaded %s\n", path);
+  host_report_breadcrumb("quick load index %d: %s", index, path);
+  if (out_path && out_path_size) snprintf(out_path, out_path_size, "%s", path);
+  return true;
+}
+
 bool SnesQuickStateLoad(char *out_path, size_t out_path_size) {
   const char *dir = s_state_dir;
   char **names = NULL;
-  int n = qs_scan(dir, &names);
+  int n = qs_list(dir, &names);
   if (n == 0) {
     qs_free_names(names, n);
     fprintf(stderr, "[quickstate] no ct_*.l3 in %s\n", dir);
     return false;
   }
-  qsort(names, (size_t)n, sizeof(char *), qs_name_cmp);
+  int idx = qs_current_index(names, n);
+  bool explicit_selection = s_selected_set &&
+                            qs_find_name(names, n, s_selected_name) >= 0;
+  char name[128];
+  snprintf(name, sizeof(name), "%s", names[idx]);
   char path[SNES_QUICKSTATE_PATH_MAX];
-  snprintf(path, sizeof(path), "%s/%s", dir, names[n - 1]);
-  fprintf(stderr, "[quickstate] loading newest %s\n", names[n - 1]);
+  snprintf(path, sizeof(path), "%s/%s", dir, name);
+  fprintf(stderr, "[quickstate] loading %s %d/%d %s\n",
+          explicit_selection ? "selected" : "newest", idx + 1, n, name);
   qs_free_names(names, n);
 
   if (!qs_read_v2(path)) return false;

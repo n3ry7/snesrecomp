@@ -50,6 +50,12 @@ enum {
    * default; see KeyMapHash_Add for why they beat the legacy F5/F9 slots. */
   kKeys_QuickSave,
   kKeys_QuickLoad,
+  /* Step the quick-state selection (snes_quickstate.c): L4 = older,
+   * R4 = newer, Left/Right Bracket on the keyboard. L2 then loads the
+   * selected snapshot instead of always the newest. Appended for the same
+   * Load/Save range reason as the two above. */
+  kKeys_PrevQuickState,
+  kKeys_NextQuickState,
   kKeys_Total,
 };
 
@@ -194,7 +200,19 @@ enum {
   kGamepadBtn_DpadRight,
   kGamepadBtn_L2,
   kGamepadBtn_R2,
+  /* The back paddles of an 8BitDo Ultimate / Xbox Elite style pad, named L4
+   * and R4 in [GamepadMap]. They arrive as SDL's LEFT_PADDLE1 / RIGHT_PADDLE1
+   * on devices SDL maps that way; see RemapSdlButton in host_main.c. */
+  kGamepadBtn_L4,
+  kGamepadBtn_R4,
+  /* Named buttons above; the slots below also hold `button:N` (a numbered
+   * SDL gamepad button / raw joystick index), which is why the per-player
+   * stride is kGamepadBtn_Slots and not kGamepadBtn_Count. */
   kGamepadBtn_Count,
+  kGamepadBtn_ButtonBase = 32,
+  /* 64 slots per player supports button:0 .. button:31; the modifier bitmask
+   * is 64 bits, one bit per slot. */
+  kGamepadBtn_Slots = 64,
 };
 
 extern Config g_config;
@@ -242,4 +260,4 @@ void ConfigEnableRewindKeys(void);
 // launcher returns PLAY.
 void WriteConfigFile(const char *filename);
 int FindCmdForSdlKey(SDL_Keycode code, SDL_Keymod mod);
-int FindCmdForGamepadButton(int button, uint32 modifiers);
+int FindCmdForGamepadButton(int button, uint64 modifiers);

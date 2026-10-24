@@ -127,13 +127,13 @@ static char g_window_title[128];
 static char g_launcher_title[160];
 
 typedef struct GamepadInfo {
-  uint32 modifiers;
+  uint64 modifiers;
   SDL_JoystickID joystick_id;
   SDL_Joystick *joystick;      /* raw (unmapped) joystick, else NULL */
   bool raw_joystick;
   uint8 index;
   uint8 axis_buttons;
-  uint16 last_cmd[kGamepadBtn_Count];
+  uint16 last_cmd[kGamepadBtn_Slots];
   Sint16 last_axis_x, last_axis_y;
 } GamepadInfo;
 
@@ -158,6 +158,12 @@ static bool g_fullscreen_changed;
 static void HandleGamepadAxisInput(GamepadInfo *gi, int axis, Sint16 value);
 static int RemapSdlButton(int button);
 static void HandleGamepadInput(GamepadInfo *gi, int button, bool pressed);
+static bool GamepadProbeEnabled(void);
+static void GamepadProbeController(SDL_GameController *controller,
+                                   SDL_JoystickID joystick_id, int player);
+static void GamepadProbeRawJoystick(SDL_Joystick *joystick, int player);
+static void GamepadProbeLogEvent(int sdl_button, bool down);
+static const char *GamepadLogicalName(int slot);
 static void HandleInput(int keyCode, int keyMod, bool pressed);
 static void HandleCommand(uint32 j, bool pressed);
 static void RequestScreenshot(void);
@@ -1813,6 +1819,12 @@ static bool HandleDeviceEvent(const SDL_Event *event) {
     return true;
   case SDL_CONTROLLERAXISMOTION:
     gi = GetGamepadInfo(SNESRECOMP_SDL_EVENT_AXIS_DEVICE(*event));
+    if (GamepadProbeEnabled()) {
+      int axis = SNESRECOMP_SDL_EVENT_AXIS(*event);
+      Sint16 value = SNESRECOMP_SDL_EVENT_AXIS_VALUE(*event);
+      if (value <= -8000 || value >= 8000)
+        fprintf(stderr, "[gamepad_probe] sdl_axis %d = %d\n", axis, value);
+    }
     if (gi)
       HandleGamepadAxisInput(gi, SNESRECOMP_SDL_EVENT_AXIS(*event),
                              SNESRECOMP_SDL_EVENT_AXIS_VALUE(*event));
@@ -1820,6 +1832,9 @@ static bool HandleDeviceEvent(const SDL_Event *event) {
   case SDL_CONTROLLERBUTTONDOWN:
   case SDL_CONTROLLERBUTTONUP:
     gi = GetGamepadInfo(SNESRECOMP_SDL_EVENT_BUTTON_DEVICE(*event));
+    if (GamepadProbeEnabled())
+      GamepadProbeLogEvent(SNESRECOMP_SDL_EVENT_BUTTON(*event),
+                           event->type == SDL_CONTROLLERBUTTONDOWN);
     if (gi) {
       int b = RemapSdlButton(SNESRECOMP_SDL_EVENT_BUTTON(*event));
       if (b >= 0)
@@ -1847,16 +1862,28 @@ static bool HandleDeviceEvent(const SDL_Event *event) {
   case SDL_JOYBUTTONDOWN:
   case SDL_JOYBUTTONUP:
     gi = GetGamepadInfo(event->jbutton.which);
-    if (gi && gi->raw_joystick && event->jbutton.button < 15) {
-      static const uint8 raw_buttons[] = {
-        kGamepadBtn_A, kGamepadBtn_B, kGamepadBtn_X, kGamepadBtn_Y,
-        kGamepadBtn_Back, kGamepadBtn_Guide, kGamepadBtn_Start,
-        kGamepadBtn_L3, kGamepadBtn_R3, kGamepadBtn_L1, kGamepadBtn_R1,
-        kGamepadBtn_DpadUp, kGamepadBtn_DpadDown,
-        kGamepadBtn_DpadLeft, kGamepadBtn_DpadRight
-      };
-      HandleGamepadInput(gi, raw_buttons[event->jbutton.button],
-                         event->type == SDL_JOYBUTTONDOWN);
+    if (GamepadProbeEnabled())
+      fprintf(stderr, "[gamepad_probe] raw button %d %s\n", event->jbutton.button,
+              event->type == SDL_JOYBUTTONDOWN ? "down" : "up");
+    if (gi && gi->raw_joystick) {
+      int b = -1;
+      if (event->jbutton.button < 15) {
+        static const uint8 raw_buttons[] = {
+          kGamepadBtn_A, kGamepadBtn_B, kGamepadBtn_X, kGamepadBtn_Y,
+          kGamepadBtn_Back, kGamepadBtn_Guide, kGamepadBtn_Start,
+          kGamepadBtn_L3, kGamepadBtn_R3, kGamepadBtn_L1, kGamepadBtn_R1,
+          kGamepadBtn_DpadUp, kGamepadBtn_DpadDown,
+          kGamepadBtn_DpadLeft, kGamepadBtn_DpadRight
+        };
+        b = raw_buttons[event->jbutton.button];
+      } else if (event->jbutton.button <
+                 kGamepadBtn_Slots - kGamepadBtn_ButtonBase) {
+        /* Beyond the named Xbox layout: a numbered slot, bindable in
+         * [GamepadMap] as button:N. */
+        b = kGamepadBtn_ButtonBase + event->jbutton.button;
+      }
+      if (b >= 0)
+        HandleGamepadInput(gi, b, event->type == SDL_JOYBUTTONDOWN);
     }
     return true;
   default:
@@ -2008,7 +2035,7 @@ static void PadGestureConfigure(PadGesture *g, const char *configured,
 static bool PadGesturePressed(PadGesture *g) {
   if (!g->ok) return false;
   const uint32 pad = OverlayNavInputs();
-  const uint32 raw = g_gamepad[0].modifiers;
+  const uint64 raw = g_gamepad[0].modifiers;
   const bool held = (pad & g->pad) == g->pad && (raw & g->raw) == g->raw;
   const bool pressed = held && !g->was_held;
   g->was_held = held;
@@ -3373,10 +3400,12 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
       { "Pause", kKeys_Pause }, { "Reset", kKeys_Reset },
       { "OpenLauncher", kKeys_OpenLauncher },
       { "QuickSave", kKeys_QuickSave }, { "QuickLoad", kKeys_QuickLoad },
+      { "PrevState", kKeys_PrevQuickState }, { "NextState", kKeys_NextQuickState },
     };
     static const SDL_Keycode kKeys[] = {
       SDLK_KP_PLUS, SDLK_KP_MINUS, SDLK_F11, SDLK_F12, SDLK_f, SDLK_p, SDLK_EQUALS, SDLK_MINUS,
       SDLK_F7, SDLK_F8, SDLK_r, SDLK_l, SDLK_F5, SDLK_F9,
+      SDLK_LEFTBRACKET, SDLK_RIGHTBRACKET,
     };
     for (size_t i = 0; i < sizeof(kProbe) / sizeof(kProbe[0]); i++) {
       const char *bound = "(unbound among the probed keys)";
@@ -3399,10 +3428,27 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
     {
       int r2 = FindCmdForGamepadButton(kGamepadBtn_R2, 0);
       int l2 = FindCmdForGamepadButton(kGamepadBtn_L2, 0);
+      int l4 = FindCmdForGamepadButton(kGamepadBtn_L4, 0);
+      int r4 = FindCmdForGamepadButton(kGamepadBtn_R4, 0);
       fprintf(stderr, "[gamemap] P1 R2 -> %s\n",
               r2 == kKeys_QuickSave ? "QuickSave" : r2 ? "other" : "(unbound)");
       fprintf(stderr, "[gamemap] P1 L2 -> %s\n",
               l2 == kKeys_QuickLoad ? "QuickLoad" : l2 ? "other" : "(unbound)");
+      fprintf(stderr, "[gamemap] P1 L4 -> %s\n",
+              l4 == kKeys_PrevQuickState ? "PrevState" : l4 ? "other" : "(unbound)");
+      fprintf(stderr, "[gamemap] P1 R4 -> %s\n",
+              r4 == kKeys_NextQuickState ? "NextState" : r4 ? "other" : "(unbound)");
+      /* Numbered [GamepadMap] bindings (`button:N`). Empty unless the config
+       * or a device-specific profile used one. */
+      for (int n = 0; n < kGamepadBtn_Slots - kGamepadBtn_ButtonBase; n++) {
+        int cmd = FindCmdForGamepadButton(kGamepadBtn_ButtonBase + n, 0);
+        if (!cmd) continue;
+        const char *name = cmd == kKeys_NextQuickState ? "NextState" :
+                           cmd == kKeys_PrevQuickState ? "PrevState" :
+                           cmd == kKeys_QuickSave ? "QuickSave" :
+                           cmd == kKeys_QuickLoad ? "QuickLoad" : "other";
+        fprintf(stderr, "[gamemap] P1 button:%d -> %s\n", n, name);
+      }
     }
   }
   if (ConfigKeyMapMigrated()) {
@@ -4583,12 +4629,29 @@ static void HandleCommand(uint32 j, bool pressed) {
     }
     case kKeys_QuickLoad: {
       char path[SNES_QUICKSTATE_PATH_MAX];
+      int idx = SnesQuickStateSelectedIndex();
+      int count = SnesQuickStateCount();
       if (SnesQuickStateLoad(path, sizeof(path))) {
-        snes_osd_push("Quick loaded", 1500);
+        char msg[48];
+        if (idx >= 0 && count > 0)
+          snprintf(msg, sizeof(msg), "Quick loaded %d/%d", idx + 1, count);
+        else
+          snprintf(msg, sizeof(msg), "Quick loaded");
+        snes_osd_push(msg, 1500);
         GameReset();
       } else {
         snes_osd_push("Quick load failed", 2000);
       }
+      break;
+    }
+    case kKeys_PrevQuickState:
+    case kKeys_NextQuickState: {
+      char msg[SNES_QUICKSTATE_OSD_MAX];
+      bool moved = SnesQuickStateStep(
+          j == kKeys_NextQuickState ? 1 : -1, msg, sizeof(msg));
+      /* Step() logs the exact line; the toast is the same string. On an empty
+       * stash it says "No saved states" and the selection is left alone. */
+      snes_osd_push(msg, moved ? 1500 : 2000);
       break;
     }
     case kKeys_ToggleRenderer:
@@ -4645,6 +4708,158 @@ static uint32 GetActiveControllers(void) {
   return ctrl << 30;
 }
 
+/* ── gamepad probe (SNESRECOMP_GAMEPAD_PROBE=1) ───────────────────────────── */
+
+/* One-time per device: the player sends us this log when their back buttons do
+ * not reach L4/R4, and the printed sdl_button numbers are what [GamepadMap]
+ * `button:N` needs. Off by default so a normal run stays quiet. */
+static bool GamepadProbeEnabled(void) {
+  const char *v = HostGetenv("GAMEPAD_PROBE");
+  return v && v[0] && v[0] != '0';
+}
+
+static SDL_JoystickID s_probed_ids[8];
+static int s_probed_count;
+
+static bool GamepadProbeSeen(SDL_JoystickID id) {
+  for (int i = 0; i < s_probed_count; i++)
+    if (s_probed_ids[i] == id) return true;
+  if (s_probed_count < (int)(sizeof(s_probed_ids) / sizeof(s_probed_ids[0])))
+    s_probed_ids[s_probed_count++] = id;
+  return false;
+}
+
+static const char *GamepadLogicalName(int slot) {
+  switch (slot) {
+  case kGamepadBtn_A: return "A";
+  case kGamepadBtn_B: return "B";
+  case kGamepadBtn_X: return "X";
+  case kGamepadBtn_Y: return "Y";
+  case kGamepadBtn_Back: return "Back";
+  case kGamepadBtn_Guide: return "Guide";
+  case kGamepadBtn_Start: return "Start";
+  case kGamepadBtn_L3: return "L3";
+  case kGamepadBtn_R3: return "R3";
+  case kGamepadBtn_L1: return "L1";
+  case kGamepadBtn_R1: return "R1";
+  case kGamepadBtn_DpadUp: return "DpadUp";
+  case kGamepadBtn_DpadDown: return "DpadDown";
+  case kGamepadBtn_DpadLeft: return "DpadLeft";
+  case kGamepadBtn_DpadRight: return "DpadRight";
+  case kGamepadBtn_L2: return "L2";
+  case kGamepadBtn_R2: return "R2";
+  case kGamepadBtn_L4: return "L4";
+  case kGamepadBtn_R4: return "R4";
+  default: return NULL;
+  }
+}
+
+/* "button:N" when the logical slot has no friendly name. */
+static void GamepadSlotLabel(int slot, char *out, size_t out_size) {
+  const char *name = GamepadLogicalName(slot);
+  if (name) snprintf(out, out_size, "%s", name);
+  else if (slot >= kGamepadBtn_ButtonBase)
+    snprintf(out, out_size, "button:%d", slot - kGamepadBtn_ButtonBase);
+  else
+    snprintf(out, out_size, "slot%d", slot);
+}
+
+static void GamepadProbeController(SDL_GameController *controller,
+                                   SDL_JoystickID joystick_id, int player) {
+  if (!GamepadProbeEnabled() || GamepadProbeSeen(joystick_id))
+    return;
+  SDL_Joystick *js = SDL_GameControllerGetJoystick(controller);
+  fprintf(stderr,
+          "[gamepad_probe] ===== gamepad '%s' player=%d joystick_id=%u =====\n",
+          SDL_GameControllerName(controller), player + 1,
+          (unsigned)joystick_id);
+#if SNESRECOMP_SDL3 || SDL_VERSION_ATLEAST(2, 0, 12)
+  fprintf(stderr,
+          "[gamepad_probe] vid=%04x pid=%04x version=%04x raw_buttons=%d raw_axes=%d\n",
+          (unsigned)SDL_GameControllerGetVendor(controller),
+          (unsigned)SDL_GameControllerGetProduct(controller),
+          (unsigned)SDL_GameControllerGetProductVersion(controller),
+          SDL_JoystickNumButtons(js), SDL_JoystickNumAxes(js));
+#else
+  fprintf(stderr, "[gamepad_probe] raw_buttons=%d raw_axes=%d\n",
+          SDL_JoystickNumButtons(js), SDL_JoystickNumAxes(js));
+#endif
+  {
+    char *mapping = SDL_GameControllerMapping(controller);
+    fprintf(stderr, "[gamepad_probe] mapping: %s\n",
+            mapping ? mapping : "(none; SDL has no gamepad mapping for this device)");
+    if (mapping) SDL_free(mapping);
+  }
+  fprintf(stderr, "[gamepad_probe] buttons SDL reports for this device "
+                  "(bind the right-hand name in [GamepadMap]):\n");
+  for (int b = 0; b < SDL_CONTROLLER_BUTTON_MAX; b++) {
+#if SNESRECOMP_SDL3 || SDL_VERSION_ATLEAST(2, 0, 14)
+    if (!SDL_GameControllerHasButton(controller,
+                                     (SDL_GameControllerButton)b))
+      continue;
+#endif
+    const char *sdl_name = SDL_GameControllerGetStringForButton(
+        (SDL_GameControllerButton)b);
+    int slot = RemapSdlButton(b);
+    char slot_name[24] = "?";
+    if (slot >= 0) GamepadSlotLabel(slot, slot_name, sizeof(slot_name));
+    fprintf(stderr, "[gamepad_probe]   sdl_button %2d = %-12s -> %s\n", b,
+            sdl_name ? sdl_name : "?", slot_name);
+  }
+  fprintf(stderr,
+          "[gamepad_probe] L4/R4: SDL's LEFT_PADDLE1/RIGHT_PADDLE1 map to "
+          "L4/R4 automatically. If this pad reports its back buttons under a "
+          "number SDL does not name, set e.g. `NextState = button:<N>` in "
+          "[GamepadMap], using the sdl_button number above.\n");
+}
+
+static void GamepadProbeRawJoystick(SDL_Joystick *joystick, int player) {
+  SDL_JoystickID id = SDL_JoystickInstanceID(joystick);
+  if (!GamepadProbeEnabled() || GamepadProbeSeen(id))
+    return;
+  fprintf(stderr,
+          "[gamepad_probe] ===== raw joystick '%s' player=%d joystick_id=%u =====\n",
+          SDL_JoystickName(joystick), player + 1, (unsigned)id);
+  fprintf(stderr,
+          "[gamepad_probe] no SDL gamepad mapping; raw_buttons=%d raw_axes=%d "
+          "(bind extras as button:N, N = 0..%d)\n",
+          SDL_JoystickNumButtons(joystick), SDL_JoystickNumAxes(joystick),
+          kGamepadBtn_Slots - kGamepadBtn_ButtonBase - 1);
+  int raw_buttons = SDL_JoystickNumButtons(joystick);
+  int shown = raw_buttons < kGamepadBtn_Slots - kGamepadBtn_ButtonBase
+                  ? raw_buttons
+                  : kGamepadBtn_Slots - kGamepadBtn_ButtonBase;
+  for (int b = 0; b < shown; b++) {
+    int slot = b < 15 ? b : kGamepadBtn_ButtonBase + b;
+    char slot_name[24] = "?";
+    if (b < 15) {
+      /* The raw Steam/Xbox button order the event path uses. */
+      static const char *const names[15] = {
+        "A", "B", "X", "Y", "Back", "Guide", "Start",
+        "L3", "R3", "L1", "R1", "DpadUp", "DpadDown", "DpadLeft", "DpadRight"
+      };
+      snprintf(slot_name, sizeof(slot_name), "%s", names[b]);
+    } else if (b < kGamepadBtn_Slots - kGamepadBtn_ButtonBase) {
+      snprintf(slot_name, sizeof(slot_name), "button:%d", b);
+    } else {
+      snprintf(slot_name, sizeof(slot_name), "(unbindable)");
+    }
+    fprintf(stderr, "[gamepad_probe]   raw_button %2d -> %s\n", b, slot_name);
+  }
+}
+
+static void GamepadProbeLogEvent(int sdl_button, bool down) {
+  if (!GamepadProbeEnabled())
+    return;
+  const char *name = SDL_GameControllerGetStringForButton(
+      (SDL_GameControllerButton)sdl_button);
+  int slot = RemapSdlButton(sdl_button);
+  char slot_name[24] = "?";
+  if (slot >= 0) GamepadSlotLabel(slot, slot_name, sizeof(slot_name));
+  fprintf(stderr, "[gamepad_probe] button %2d (%s) %s -> %s\n", sdl_button,
+          name ? name : "?", down ? "down" : "up", slot_name);
+}
+
 static void OpenOneGamepad(int i) {
   if (!SDL_IsGameController(i)) {
     OpenOneJoystick(i);
@@ -4677,6 +4892,7 @@ static void OpenOneGamepad(int i) {
   }
 
   printf("Found controller '%s' assigning to player %d\n", SDL_GameControllerName(controller), found_idx + 1);
+  GamepadProbeController(controller, joystick_id, found_idx >= 0 ? found_idx : 0);
   if (found_idx >= 0) {
     GamepadInfo *gi = &g_gamepad[found_idx];
     memset(gi, 0, sizeof(GamepadInfo));
@@ -4707,6 +4923,7 @@ static void OpenOneJoystick(int i) {
   gi->raw_joystick = true;
   gi->index = slot;
   gi->joystick_id = id;
+  GamepadProbeRawJoystick(joystick, slot);
   printf("Found unmapped raw joystick '%s' assigning to player %d\n",
          SDL_JoystickName(joystick), slot + 1);
 }
@@ -4728,8 +4945,29 @@ static int RemapSdlButton(int button) {
   case SDL_CONTROLLER_BUTTON_DPAD_DOWN: return kGamepadBtn_DpadDown;
   case SDL_CONTROLLER_BUTTON_DPAD_LEFT: return kGamepadBtn_DpadLeft;
   case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: return kGamepadBtn_DpadRight;
-  default: return -1;
+  default: break;
   }
+  /* The 8BitDo Ultimate's L4/R4 back buttons arrive as SDL's left/right
+   * paddles when SDL's mapping names them. SDL2 called the upper-left one
+   * PADDLE1; SDL3 renamed the pair by hand, so both spellings are handled.
+   * A device SDL leaves unnamed falls through to its numbered slot, which
+   * [GamepadMap] can bind as button:N. */
+#if SNESRECOMP_SDL3
+  switch (button) {
+  case SDL_GAMEPAD_BUTTON_LEFT_PADDLE1: return kGamepadBtn_L4;
+  case SDL_GAMEPAD_BUTTON_RIGHT_PADDLE1: return kGamepadBtn_R4;
+  default: break;
+  }
+#else
+  switch (button) {
+  case SDL_CONTROLLER_BUTTON_PADDLE1: return kGamepadBtn_L4;
+  case SDL_CONTROLLER_BUTTON_PADDLE2: return kGamepadBtn_R4;
+  default: break;
+  }
+#endif
+  if (button >= 0 && button < kGamepadBtn_Slots - kGamepadBtn_ButtonBase)
+    return kGamepadBtn_ButtonBase + button;
+  return -1;
 }
 
 /* Set/clear a SNES controller bit from a gamepad source. Mirrors
@@ -4756,11 +4994,15 @@ static void SetPadButtonOrFallthrough(uint32 j, bool pressed) {
 }
 
 static void HandleGamepadInput(GamepadInfo *gi, int button, bool pressed) {
-  if (!!(gi->modifiers & (1 << button)) == pressed)
+  if (button < 0 || button >= kGamepadBtn_Slots)
     return;
-  gi->modifiers ^= 1 << button;
+  uint64 bit = 1ull << button;
+  if (!!(gi->modifiers & bit) == pressed)
+    return;
+  gi->modifiers ^= bit;
   if (pressed)
-    gi->last_cmd[button] = FindCmdForGamepadButton(button + gi->index * kGamepadBtn_Count, gi->modifiers);
+    gi->last_cmd[button] = FindCmdForGamepadButton(
+        button + gi->index * kGamepadBtn_Slots, gi->modifiers);
   if (gi->last_cmd[button] != 0)
     SetPadButtonOrFallthrough(gi->last_cmd[button], pressed);
 }
@@ -4920,6 +5162,9 @@ static const char kDefaultConfigIniContent[] =
   "# (saves/states). F5/F9 beat the legacy Load slots they overlap.\n"
   "QuickSave = F5\n"
   "QuickLoad = F9\n"
+  "# Step through that stash; L2 loads the selected snapshot.\n"
+  "PrevState = Left Bracket\n"
+  "NextState = Right Bracket\n"
   "Load =      F1,     F2,     F3,     F4,     F5,     F6,     F7,     F8,     F9,     F10\n"
   "Save = Shift+F1,Shift+F2,Shift+F3,Shift+F4,Shift+F5,Shift+F6,Shift+F7,Shift+F8,Shift+F9,Shift+F10\n"
   "\n"
@@ -4936,9 +5181,13 @@ static const char kDefaultConfigIniContent[] =
   "Controls =   DpadUp, DpadDown, DpadLeft, DpadRight, Back, Start, B, A, Y, X, Lb, Rb\n"
   "ControlsP2 = DpadUp, DpadDown, DpadLeft, DpadRight, Back, Start, B, A, Y, X, Lb, Rb\n"
   "\n"
-  "# Player 1's analog triggers: R2 quick-saves, L2 loads the newest snapshot.\n"
+  "# Player 1's analog triggers: R2 quick-saves, L2 loads the selected\n"
+  "# snapshot. The back paddles step the stash (L4 older, R4 newer); a\n"
+  "# controller whose back buttons SDL reports by number can bind button:N.\n"
   "QuickSave = R2\n"
-  "QuickLoad = L2\n";
+  "QuickLoad = L2\n"
+  "PrevState = L4\n"
+  "NextState = R4\n";
 
 static const char *DefaultConfigIni(void) {
   if (g_game->default_config_ini) return g_game->default_config_ini;
