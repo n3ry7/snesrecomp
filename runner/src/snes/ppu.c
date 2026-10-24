@@ -274,6 +274,7 @@ bool PpuSetOverlayOamRange(Ppu *ppu, uint8_t first, uint8_t count) {
 
 static inline void PpuResetLayerPolicies(Ppu *ppu) {
   ppu->wsLayerClamp = 0;
+  ppu->wsLayerEdgeTile = 0;
   ppu->wsLayerMirror = 0;
   ppu->wsLayerRepeat = 0;
   memset(ppu->wsClampY0, 0, sizeof(ppu->wsClampY0));
@@ -457,6 +458,11 @@ void PpuSetWidescreenLayerMirror(Ppu *ppu, uint8_t mask) {
 
 void PpuSetWidescreenLayerRepeat(Ppu *ppu, uint8_t mask) {
   ppu->wsLayerRepeat = mask;
+}
+
+void PpuSetWidescreenLayerEdgeTile(Ppu *ppu, uint8_t mask, uint8_t tile_px) {
+  ppu->wsLayerEdgeTile = mask;
+  ppu->wsLayerEdgeTilePx = (tile_px >= 2) ? tile_px : 8;
 }
 
 void PpuSetWidescreenLayerClampBand(Ppu *ppu, uint8_t layer, uint8_t y0,
@@ -1733,6 +1739,35 @@ static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu,
 // Merge one isolated layer into the live priority buffer, padding only that
 // layer's side margins so transparent pixels never duplicate lower layers or
 // sprites. `repeat` selects cyclic continuation; otherwise reflect the edge.
+/* Tile-periodic edge continuation: margins repeat the outermost tile of the
+ * native scanline with its own period, so the picture continues without the
+ * symmetry of a mirror and without stretching the edge. */
+static void PpuMergeEdgeTileBackground(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
+                                       const PpuPixelPrioBufs *layerbuf,
+                                       int tile) {
+  PpuZbufType *dst = dstbuf->data;
+  const PpuZbufType *src = layerbuf->data;
+  if (tile < 2) tile = 8;
+  for (int x = 0; x < kPpuXPixels; x++) {
+    int i = x + kPpuExtraLeftRight;
+    if (src[i] > dst[i]) dst[i] = src[i];
+  }
+  for (int x = -ppu->extraLeftCur; x < 0; x++) {
+    int m = x % tile; if (m < 0) m += tile;
+    int si = m + kPpuExtraLeftRight;
+    int di = x + kPpuExtraLeftRight;
+    if (src[si] > dst[di]) dst[di] = src[si];
+  }
+  const int right = ppu->extraRightCur;
+  for (int x = kPpuXPixels; x < kPpuXPixels + right; x++) {
+    int base = kPpuXPixels - tile;
+    int m = (x - base) % tile;
+    int si = base + m + kPpuExtraLeftRight;
+    int di = x + kPpuExtraLeftRight;
+    if (src[si] > dst[di]) dst[di] = src[si];
+  }
+}
+
 static void PpuMergePaddedBackground(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
                                      const PpuPixelPrioBufs *layerbuf,
                                      bool repeat, bool full_budget) {
@@ -1859,10 +1894,11 @@ static void PpuDrawBackground_4bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
   uint8_t padding = ppu->wsLayerMirror | ppu->wsLayerRepeat;
   bool repeat_band = PpuWidescreenLayerRepeatBandActive(ppu, layer, y);
   bool stretch_band = PpuWidescreenLayerStretchBandActive(ppu, layer, y);
+  const bool edge_tile = (ppu->wsLayerEdgeTile & (1u << layer)) != 0;
   int world_band = PpuWidescreenLayerWorldBandAt(ppu, layer, (int)y);
   int elastic_band = PpuWidescreenLayerElasticBandAt(ppu, layer, (int)y);
   if (!(padding & (1u << layer)) && !repeat_band && !stretch_band &&
-      world_band < 0 && elastic_band < 0) {
+      !edge_tile && world_band < 0 && elastic_band < 0) {
     if (PPU_bigTiles(ppu, layer))
       PpuDrawBackgroundBig(ppu, dstbuf, y, sub, layer, 4, zhi, zlo, mosaic);
     else if (mosaic)
@@ -1898,6 +1934,9 @@ static void PpuDrawBackground_4bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
                                     ppu->hScroll[layer]);
   } else if (stretch_band) {
     PpuMergeStretchedBackground(ppu, dstbuf, &layerbuf);
+  } else if (edge_tile) {
+    PpuMergeEdgeTileBackground(ppu, dstbuf, &layerbuf,
+                               ppu->wsLayerEdgeTilePx);
   } else {
     PpuMergePaddedBackground(ppu, dstbuf, &layerbuf,
                              repeat_band ||
@@ -1917,10 +1956,11 @@ static void PpuDrawBackground_2bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
   uint8_t padding = ppu->wsLayerMirror | ppu->wsLayerRepeat;
   bool repeat_band = PpuWidescreenLayerRepeatBandActive(ppu, layer, y);
   bool stretch_band = PpuWidescreenLayerStretchBandActive(ppu, layer, y);
+  const bool edge_tile = (ppu->wsLayerEdgeTile & (1u << layer)) != 0;
   int world_band = PpuWidescreenLayerWorldBandAt(ppu, layer, (int)y);
   int elastic_band = PpuWidescreenLayerElasticBandAt(ppu, layer, (int)y);
   if (!(padding & (1u << layer)) && !repeat_band && !stretch_band &&
-      world_band < 0 && elastic_band < 0) {
+      !edge_tile && world_band < 0 && elastic_band < 0) {
     if (PPU_bigTiles(ppu, layer))
       PpuDrawBackgroundBig(ppu, dstbuf, y, sub, layer, 2, zhi, zlo, mosaic);
     else if (mosaic)
@@ -1954,6 +1994,9 @@ static void PpuDrawBackground_2bpp_policy(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
                                     ppu->hScroll[layer]);
   } else if (stretch_band) {
     PpuMergeStretchedBackground(ppu, dstbuf, &layerbuf);
+  } else if (edge_tile) {
+    PpuMergeEdgeTileBackground(ppu, dstbuf, &layerbuf,
+                               ppu->wsLayerEdgeTilePx);
   } else {
     PpuMergePaddedBackground(ppu, dstbuf, &layerbuf,
                              repeat_band ||

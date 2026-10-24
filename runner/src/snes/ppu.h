@@ -248,6 +248,9 @@ struct Ppu {
   // Clamp keeps a layer in the authentic 256 columns. Mirror/repeat render
   // the authentic scanline in isolation and use it to fill the side margins.
   uint8_t wsLayerClamp, wsLayerMirror, wsLayerRepeat;
+  // Tile-periodic edge continuation for the side margins (see
+  // PpuSetWidescreenLayerEdgeTile).  0 = off.
+  uint8_t wsLayerEdgeTile, wsLayerEdgeTilePx;
   // Optional scanline bands: clamp or cyclically repeat only [y0,y1).
   uint8_t wsClampY0[4], wsClampY1[4];
   uint8_t wsRepeatY0[4], wsRepeatY1[4];
@@ -812,6 +815,12 @@ void PpuSetWidescreenWindowExpansion(Ppu *ppu, uint8_t layer_mask,
 // and color-math-correct. Repeat wins if both bits are set. Re-apply per frame.
 void PpuSetWidescreenLayerMirror(Ppu *ppu, uint8_t mask);
 void PpuSetWidescreenLayerRepeat(Ppu *ppu, uint8_t mask);
+// Continue a layer into the side margins by repeating its OUTERMOST tile
+// (tile_px wide, usually 8) with the tile's own 8-px period, instead of
+// reflecting the whole scanline.  No mirror symmetry, no resampling: the
+// margin reads as the same terrain/border texture continuing.  Re-apply per
+// frame; PpuSetExtraSpace* clears it.
+void PpuSetWidescreenLayerEdgeTile(Ppu *ppu, uint8_t mask, uint8_t tile_px);
 
 // Apply clamp, cyclic-repeat, or stretch only on scanlines [y0,y1).
 // y1<=y0 disables. Repeat/stretch bands apply to Mode-1 4bpp and 2bpp
